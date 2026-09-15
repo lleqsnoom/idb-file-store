@@ -91,6 +91,7 @@ export function toPublicRecord(
 ): FileRecord {
   const record: FileRecord = {
     id: stored.id,
+    contentId: stored.contentId,
     name: stored.name,
     kind: stored.kind,
     mime: stored.mime,

@@ -86,7 +86,16 @@ function trackOpenRequest(
   };
 
   request.onerror = () => reject(request.error ?? new Error('Failed to open the database'));
-  request.onblocked = (event) => options.onBlocked?.(event);
+  request.onblocked = (event) => {
+    options.onBlocked?.(event);
+    // Without this the promise never settles: the upgrade waits for the other tab to
+    // close, which may never happen. Callers get a reason instead of a silent stall.
+    reject(
+      new NotSupportedError(
+        `Upgrading "${options.name}" is blocked because another tab holds an older version open. Close it and reload.`,
+      ),
+    );
+  };
 }
 
 /** Runs the migration callback, rolling the upgrade back when it throws. */

@@ -18,8 +18,10 @@ import {
   upgradeSchema,
 } from './storage/schema.js';
 import {
+  countChunks,
   deleteChunks,
-  deleteChunksForMany,
+  hasContent,
+  listContentIds,
   readChunkRange,
   readChunks,
   writeChunks,
@@ -93,7 +95,10 @@ export interface FileDBOptions {
   thumbnailMaxSize?: number;
   /** Compute a content hash on write. Defaults to `true`. */
   computeHash?: boolean;
-  /** Skip hashing above this size, in bytes. Defaults to 64 MiB. */
+  /**
+   * Skip hashing above this size, in bytes. Defaults to no ceiling, because sharing
+   * identical bytes needs a hash; opt out with `computeHash: false`.
+   */
   hashMaxBytes?: number;
   /** Return an existing record when an identical payload is added. Defaults to `false`. */
   dedupe?: boolean;
@@ -149,7 +154,9 @@ const DEFAULTS: ResolvedOptions = {
   generateThumbnails: true,
   thumbnailMaxSize: DEFAULT_THUMBNAIL_SIZE,
   computeHash: true,
-  hashMaxBytes: 64 * 1024 * 1024,
+  // No ceiling by default: sharing needs a hash, and large video is exactly where
+  // sharing saves the most. `computeHash: false` opts out, and a caller can cap it.
+  hashMaxBytes: Number.POSITIVE_INFINITY,
   dedupe: false,
   syncTabs: true,
   indexedDB: undefined,
@@ -225,7 +232,7 @@ export class FileDB {
       name: this.#options.name,
       version: this.#options.version,
       factory: this.#options.indexedDB,
-      upgrade: (target, oldVersion) => upgradeSchema(target, oldVersion),
+      upgrade: (target, oldVersion, tx) => upgradeSchema(target, oldVersion, tx),
       onVersionChange: () => {
         this.#db = null;
       },
@@ -323,8 +330,16 @@ export class FileDB {
         const clash = await wait(store.get(row.id) as IDBRequest<StoredFile | undefined>);
         if (clash) throw new ValidationError(`A record with id "${row.id}" already exists`);
 
-        const layout = await writeChunks(tx, wait, row.id, prepared.blob, prepared.chunkSize);
+        const layout = await this.#storeContent(
+          tx,
+          wait,
+          row.contentId,
+          row.hash,
+          prepared.blob,
+          prepared.chunkSize,
+        );
         row.chunkCount = layout.chunkCount;
+        row.chunkSize = layout.chunkSize;
         await wait(store.put(row));
         if (prepared.thumbnail) {
           await wait(tx.objectStore(STORE_THUMBS).put(prepared.thumbnail));
@@ -393,7 +408,7 @@ export class FileDB {
     this.#assertOpen();
     return this.transaction([STORE_FILES, STORE_CHUNKS], 'readonly', async (tx, wait) => {
       const row = await this.#requireRow(tx, wait, id);
-      return readChunks(tx, id, row.mime, row.chunkCount);
+      return readChunks(tx, row.contentId, row.mime, row.chunkCount);
     });
   }
 
@@ -402,7 +417,7 @@ export class FileDB {
     this.#assertOpen();
     return this.transaction([STORE_FILES, STORE_CHUNKS], 'readonly', async (tx, wait) => {
       const row = await this.#requireRow(tx, wait, id);
-      return readChunkRange(tx, wait, id, start, end, row.mime, row.chunkSize);
+      return readChunkRange(tx, wait, row.contentId, start, end, row.mime, row.chunkSize);
     });
   }
 
@@ -499,8 +514,15 @@ export class FileDB {
         const next: StoredFile = { ...row };
 
         if (replacement) {
-          await deleteChunks(tx, wait, id);
-          const layout = await writeChunks(tx, wait, id, replacement.blob, replacement.chunkSize);
+          next.contentId = replacement.row.contentId;
+          const layout = await this.#storeContent(
+            tx,
+            wait,
+            next.contentId,
+            next.hash,
+            replacement.blob,
+            replacement.chunkSize,
+          );
           next.chunkCount = layout.chunkCount;
           next.chunkSize = layout.chunkSize;
           next.size = replacement.blob.size;
@@ -524,7 +546,11 @@ export class FileDB {
         next.updatedAt = toTimestamp(options.updatedAt) ?? now();
         refreshSearchColumns(next);
 
+        const previousContent = row.contentId;
         await wait(store.put(next));
+        if (previousContent !== next.contentId) {
+          await this.#releaseUnreferencedContent(tx, wait, [previousContent]);
+        }
         return next;
       },
     );
@@ -624,11 +650,13 @@ export class FileDB {
           const row = await wait(store.get(id) as IDBRequest<StoredFile | undefined>);
           if (row) found.push(row);
         }
-        await deleteChunksForMany(tx, wait, found.map((row) => row.id));
         for (const row of found) {
           await wait(store.delete(row.id));
           await wait(thumbs.delete(row.id));
         }
+        // Deleting the rows first means the count below sees exactly the references that
+        // remain, so content shared with another record, or held by a trashed one, survives.
+        await this.#releaseUnreferencedContent(tx, wait, found.map((row) => row.contentId));
         return found;
       },
     );
@@ -655,35 +683,29 @@ export class FileDB {
     this.#post('clear', null);
   }
 
-  /** Deletes chunk and thumbnail rows that no longer belong to a record. */
+  /** Deletes content and previews that no record references any more. */
   async pruneOrphans(): Promise<number> {
     return this.transaction(
       [STORE_FILES, STORE_CHUNKS, STORE_THUMBS],
       'readwrite',
       async (tx, wait) => {
-        const store = tx.objectStore(STORE_FILES);
-        const live = new Set(
-          (await collectAll<StoredFile>(store, null)).map((row) => row.id),
-        );
-        let removed = 0;
+        const rows = await collectAll<StoredFile>(tx.objectStore(STORE_FILES), null);
+        const referenced = new Set(rows.map((row) => row.contentId));
+        const recordIds = new Set(rows.map((row) => row.id));
 
-        const chunks = tx.objectStore(STORE_CHUNKS);
-        const chunkKeys = await collectKeys(chunks, null);
-        for (const key of chunkKeys) {
-          const fileId = Array.isArray(key) ? (key[0] as string) : (key as string);
-          if (!live.has(fileId)) {
-            await wait(chunks.delete(key));
-            removed += 1;
-          }
+        let removed = 0;
+        for (const contentId of await listContentIds(tx)) {
+          if (referenced.has(contentId)) continue;
+          removed += await countChunks(tx, wait, contentId);
+          await deleteChunks(tx, wait, contentId);
         }
 
         const thumbs = tx.objectStore(STORE_THUMBS);
         const thumbKeys = await collectKeys(thumbs, null);
         for (const key of thumbKeys) {
-          if (!live.has(key as string)) {
-            await wait(thumbs.delete(key));
-            removed += 1;
-          }
+          if (recordIds.has(key as string)) continue;
+          await wait(thumbs.delete(key));
+          removed += 1;
         }
         return removed;
       },
@@ -820,6 +842,7 @@ export class FileDB {
     const rows = await this.transaction(STORE_FILES, 'readonly', async (tx) =>
       collectAll<StoredFile>(tx.objectStore(STORE_FILES), null),
     );
+    const physicalSize = await this.#physicalSize();
 
     const byKind: Record<string, { count: number; size: number }> = {};
     const byMime: Record<string, { count: number; size: number }> = {};
@@ -847,6 +870,8 @@ export class FileDB {
     return {
       count,
       size,
+      physicalSize,
+      sharedBytes: Math.max(0, size - physicalSize),
       trashedCount,
       trashedSize,
       byKind,
@@ -889,7 +914,7 @@ export class FileDB {
         for (const row of rows) {
           out.push({
             record: toPublicRecord(row, { text: row.text }),
-            blob: await readChunks(tx, row.id, row.mime, row.chunkCount),
+            blob: await readChunks(tx, row.contentId, row.mime, row.chunkCount),
           });
         }
         return out;
@@ -922,7 +947,11 @@ export class FileDB {
         width: entry.record.width ?? undefined,
         height: entry.record.height ?? undefined,
         durationMs: entry.record.durationMs ?? undefined,
-        computeHash: false,
+        // Hashing is recomputed rather than trusted from the backup: a corrupted file
+        // could carry a hash that does not match its bytes, and a wrong hash would alias
+        // the wrong content to a record silently. Recomputing also restores the sharing
+        // the original database had, instead of writing one copy per record.
+        computeHash: true,
         extractText: false,
         generateThumbnail: false,
         text: entry.record.text ?? '',
@@ -1013,6 +1042,75 @@ export class FileDB {
     );
   }
 
+  /**
+   * Stores content, or adopts what is already there.
+   *
+   * Identical bytes produce the same content id, so a second record normally finds the
+   * chunks already written. It then copies the stored layout instead of writing its own:
+   * rewriting with a different chunk size would either corrupt the shared bytes or
+   * duplicate them.
+   *
+   * Content can outlive its records, for instance when a purge was interrupted. If
+   * chunks exist but no record describes them there is no layout to adopt, so the
+   * content is replaced outright: deleting first is what stops chunks from the old
+   * layout surviving alongside the new ones.
+   */
+  async #storeContent(
+    tx: IDBTransaction,
+    wait: Wait,
+    contentId: string,
+    hash: string | null,
+    blob: Blob,
+    chunkSize: number,
+  ): Promise<{ chunkCount: number; chunkSize: number }> {
+    if (await hasContent(tx, wait, contentId)) {
+      const owner = hash ? await this.#findRowByHash(tx, wait, hash) : null;
+      if (owner) return { chunkCount: owner.chunkCount, chunkSize: owner.chunkSize };
+      await deleteChunks(tx, wait, contentId);
+    }
+    return writeChunks(tx, wait, contentId, blob, chunkSize);
+  }
+
+  /**
+   * Deletes the chunks of any content id no record references any more.
+   *
+   * The count is derived from the `files` store's `by_content` index rather than kept in
+   * a counter, so it cannot drift: whatever the records say is the truth. Callers must
+   * have removed or rewritten the rows that used to point here before calling, so the
+   * count reflects the references that remain. Trashed records still count, which is why
+   * content survives until the trash is purged.
+   */
+  async #releaseUnreferencedContent(
+    tx: IDBTransaction,
+    wait: Wait,
+    contentIds: readonly string[],
+  ): Promise<void> {
+    const index = tx.objectStore(STORE_FILES).index(INDEX.contentId);
+    for (const contentId of new Set(contentIds)) {
+      const remaining = await wait(index.count(IDBKeyRange.only(contentId)));
+      if (remaining === 0) await deleteChunks(tx, wait, contentId);
+    }
+  }
+
+  /** Sum of the bytes actually held in the chunk store. */
+  async #physicalSize(): Promise<number> {
+    return this.transaction(STORE_CHUNKS, 'readonly', async (tx) => {
+      const rows = await collectAll<{ data: Blob }>(tx.objectStore(STORE_CHUNKS), null);
+      return rows.reduce((total, row) => total + row.data.size, 0);
+    });
+  }
+
+  /** First stored row that already carries this hash, if any. */
+  async #findRowByHash(
+    tx: IDBTransaction,
+    wait: Wait,
+    hash: string,
+  ): Promise<StoredFile | undefined> {
+    const index = tx.objectStore(STORE_FILES).index(INDEX.hash);
+    const matches = await wait(index.getAll(IDBKeyRange.only(hash)) as IDBRequest<StoredFile[]>);
+    return matches[0];
+  }
+
   async #findByHash(hash: string): Promise<FileRecord | null> {
     return this.transaction(STORE_FILES, 'readonly', async (tx, wait) => {
       const index = tx.objectStore(STORE_FILES).index(INDEX.hash);
@@ -1043,7 +1141,7 @@ export class FileDB {
       const extras: { text?: string; blob?: Blob; thumbnail?: Blob } = {};
       if (readOptions.includeText) extras.text = row.text;
       if (readOptions.includeBlob) {
-        extras.blob = await readChunks(tx, id, row.mime, row.chunkCount);
+        extras.blob = await readChunks(tx, row.contentId, row.mime, row.chunkCount);
       }
       if (readOptions.includeThumbnail) {
         const thumb = await wait(
@@ -1161,7 +1259,7 @@ export class FileDB {
       for (const { row, score } of selection.rows) {
         const extras: { text?: string; blob?: Blob; thumbnail?: Blob } = {};
         if (wantText) extras.text = row.text;
-        if (wantBlob) extras.blob = await readChunks(tx, row.id, row.mime, row.chunkCount);
+        if (wantBlob) extras.blob = await readChunks(tx, row.contentId, row.mime, row.chunkCount);
         if (wantThumb) {
           const thumb = await wait(
             tx.objectStore(STORE_THUMBS).get(row.id) as IDBRequest<StoredThumbnail | undefined>,

@@ -56,6 +56,11 @@ export const FILE_KINDS: readonly FileKind[] = [
 export interface FileRecord {
   /** Stable unique id (`crypto.randomUUID()` unless supplied). */
   id: string;
+  /**
+   * Key the bytes are stored under. Two records with identical bytes share one
+   * `contentId`, and therefore one copy on disk.
+   */
+  contentId: string;
   /** Display name including the extension, e.g. `holiday-2024.mp4`. */
   name: string;
   /** Coarse category derived from the MIME type. */
@@ -133,8 +138,12 @@ export interface Page<T> {
 export interface StorageStats {
   /** Number of live (non-trashed) records. */
   count: number;
-  /** Total bytes of live records. */
+  /** Total bytes of live records, counted per record. Sharing can make this exceed what is stored. */
   size: number;
+  /** Bytes actually held in the chunk store. Never above `size`. */
+  physicalSize: number;
+  /** `size - physicalSize`: the bytes saved by records sharing identical content. */
+  sharedBytes: number;
   /** Number of trashed records. */
   trashedCount: number;
   /** Total bytes of trashed records. */

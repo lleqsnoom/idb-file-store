@@ -7,6 +7,36 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- Records with identical bytes now share one copy on disk. Chunks are addressed by a
+  content id, which is the payload's hash when one was computed, and the copy is released
+  when the last record referencing it is purged. `FileRecord.contentId` exposes the key,
+  and `stats()` gains `physicalSize` and `sharedBytes` alongside the existing logical
+  `size`.
+
+### Changed
+
+- **Schema version 2.** The `chunks` store is keyed `['contentId','index']` instead of
+  `['fileId','index']`, and `files` gains a `by_content` index. Existing databases rekey
+  their chunks during the upgrade, inside the version-change transaction, so an
+  interrupted upgrade leaves the database on version 1.
+- `hashMaxBytes` no longer defaults to 64 MiB. Sharing needs a hash, so every payload is
+  hashed unless a caller opts out with `computeHash: false` or sets a smaller ceiling.
+  `add()` therefore reads a hashed payload twice, once to hash and once to slice.
+- `FileDB.open()` now rejects when an upgrade is blocked by another tab holding an older
+  version open, instead of waiting forever.
+- `dedupe` is unchanged in meaning ("return the existing record") and is now independent
+  of sharing, which is automatic.
+
+### Fixed
+
+- `pruneOrphans()` sweeps content no record references, and reports the chunk rows it
+  removes.
+- `restoreBackup()` recomputes hashes rather than trusting the ones recorded in a backup,
+  so a corrupt backup cannot alias the wrong content to a record. This also means a
+  restored database keeps the sharing the original had.
+
 ### Changed
 
 - Stopped writing two unused columns to every record. The merged search text and its

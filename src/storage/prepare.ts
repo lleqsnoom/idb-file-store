@@ -108,12 +108,13 @@ export async function prepareWrite(
     blob,
     chunkSize: normalizeChunkSize(options.chunkSize ?? config.chunkSize),
     thumbnail: preview.thumbnail,
-    row: buildStoredRow({ name, mime, kind, size: blob.size, hash, text, preview, options }),
+    row: buildStoredRow({ id, name, mime, kind, size: blob.size, hash, text, preview, options }),
   };
 }
 
 /** Everything the row needs once detection has run. */
 interface RowInput {
+  id: string;
   name: string;
   mime: string;
   kind: FileKind;
@@ -183,10 +184,21 @@ function rowContext(input: RowInput): RowContext {
 /** What the payload is: identity, type, size and the content hash. */
 function identityFields(context: RowContext): Pick<
   StoredRow,
-  'name' | 'nameLower' | 'kind' | 'mime' | 'extension' | 'size' | 'hash' | 'revision'
+  | 'contentId'
+  | 'name'
+  | 'nameLower'
+  | 'kind'
+  | 'mime'
+  | 'extension'
+  | 'size'
+  | 'hash'
+  | 'revision'
 > {
   const { input } = context;
   return {
+    // A hashed payload shares one content id with its identical twins; an unhashed one
+    // falls back to its own id, so it can never be mistaken for another record's content.
+    contentId: input.hash ?? input.id,
     name: input.name,
     nameLower: context.columns.nameLower,
     kind: input.kind,

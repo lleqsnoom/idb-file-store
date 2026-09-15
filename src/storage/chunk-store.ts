@@ -4,16 +4,18 @@ import { collectFromCursor, type Wait } from './idb.js';
 import { CHUNK_INDEX, STORE_CHUNKS } from './schema.js';
 
 /**
- * Chunked blob storage.
+ * Chunked blob storage, keyed by content.
  *
- * Bytes never live in the `files` record. They are sliced into fixed-size pieces
- * and written to the `chunks` store, keyed by `[fileId, index]`. That means:
- * - a multi-gigabyte video is never held in memory as one allocation,
- * - reading a byte range (a video seek, a PDF page) only touches the needed chunks,
- * - deleting a file is a range delete on one index, not a rewrite of the record.
+ * Bytes are addressed by a **content id**, not by the record that uses them, so two
+ * records with identical bytes reference one copy. The content id is the content hash
+ * when one was computed and a private id otherwise, which means identical payloads
+ * collide on the same keys while unhashed payloads stay independent.
  *
- * Every helper takes the live transaction explicitly, so the caller controls
- * atomicity: writing a record and its chunks always commits or rolls back together.
+ * Chunks are written once and never rewritten: a record that adopts existing content
+ * copies its layout instead of writing its own.
+ *
+ * Every helper takes the live transaction explicitly, so the caller controls atomicity:
+ * checking whether content exists, writing it and writing the record commit together.
  */
 
 /** Default slice size: 2 MiB, a good balance for pictures and long videos. */
@@ -36,45 +38,68 @@ export function chunkCountFor(size: number, chunkSize: number): number {
   return Math.max(1, Math.ceil(size / chunkSize));
 }
 
-/** Writes the bytes of `blob` as chunks. Resolves with the resulting chunk layout. */
+/** How a content id is laid out on disk. */
+export interface ContentLayout {
+  chunkCount: number;
+  chunkSize: number;
+}
+
+/** `true` when the content id already has chunks stored. */
+export async function hasContent(
+  transaction: IDBTransaction,
+  wait: Wait,
+  contentId: string,
+): Promise<boolean> {
+  return (await countChunks(transaction, wait, contentId)) > 0;
+}
+
+/** Number of chunks stored for a content id. */
+export function countChunks(
+  transaction: IDBTransaction,
+  wait: Wait,
+  contentId: string,
+): Promise<number> {
+  const index = transaction.objectStore(STORE_CHUNKS).index(CHUNK_INDEX.contentId);
+  return wait(index.count(IDBKeyRange.only(contentId)));
+}
+
+/** Writes the bytes of `blob` under `contentId`. Resolves with the layout written. */
 export async function writeChunks(
   transaction: IDBTransaction,
   wait: Wait,
-  fileId: string,
+  contentId: string,
   blob: Blob,
   chunkSize: number,
-): Promise<{ chunkCount: number; chunkSize: number }> {
+): Promise<ContentLayout> {
   const store = transaction.objectStore(STORE_CHUNKS);
-  const total = chunkCountFor(blob.size, chunkSize);
-  // Sequential slicing keeps at most `chunkSize` bytes alive at once; the puts
-  // themselves are issued in parallel so the transaction commits in one round trip.
+  const chunkCount = chunkCountFor(blob.size, chunkSize);
+  // Slicing one chunk at a time keeps at most `chunkSize` bytes alive; the puts are
+  // issued in parallel so the transaction commits in one round trip.
   const pending: Promise<unknown>[] = [];
-  for (let index = 0; index < total; index += 1) {
+  for (let index = 0; index < chunkCount; index += 1) {
     const start = index * chunkSize;
     const slice = blob.slice(start, Math.min(start + chunkSize, blob.size), blob.type);
-    const chunk: StoredChunk = { fileId, index, data: slice };
+    const chunk: StoredChunk = { contentId, index, data: slice };
     pending.push(wait(store.put(chunk)));
   }
   await Promise.all(pending);
-  return { chunkCount: total, chunkSize };
+  return { chunkCount, chunkSize };
 }
 
 /** Reads every chunk back and reassembles them into a single blob. */
 export async function readChunks(
   transaction: IDBTransaction,
-  fileId: string,
+  contentId: string,
   mime: string,
   expectedChunks = 0,
 ): Promise<Blob> {
-  const index = transaction.objectStore(STORE_CHUNKS).index(CHUNK_INDEX.fileId);
-  const rows = await collectFromCursor<StoredChunk>(index, IDBKeyRange.only(fileId), 'next');
+  const rows = await readContentChunks(transaction, contentId);
   if (rows.length === 0) {
     if (expectedChunks > 0) {
-      throw new NotFoundError(`Bytes for "${fileId}" are missing from the chunk store`);
+      throw new NotFoundError(`Bytes for content "${contentId}" are missing from the chunk store`);
     }
     return new Blob([], { type: mime });
   }
-  rows.sort((a, b) => a.index - b.index);
   return new Blob(
     rows.map((row) => row.data),
     { type: mime },
@@ -88,7 +113,7 @@ export async function readChunks(
 export async function readChunkRange(
   transaction: IDBTransaction,
   wait: Wait,
-  fileId: string,
+  contentId: string,
   start: number,
   end: number,
   mime: string,
@@ -101,14 +126,16 @@ export async function readChunkRange(
 
   const requests: Promise<StoredChunk | undefined>[] = [];
   for (let index = firstIndex; index <= lastIndex; index += 1) {
-    requests.push(wait(store.get([fileId, index]) as IDBRequest<StoredChunk | undefined>));
+    requests.push(wait(store.get([contentId, index]) as IDBRequest<StoredChunk | undefined>));
   }
   const rows = await Promise.all(requests);
 
   const parts: Blob[] = [];
   for (let offset = 0; offset < rows.length; offset += 1) {
     const row = rows[offset];
-    if (!row) throw new NotFoundError(`Chunk ${firstIndex + offset} of "${fileId}" is missing`);
+    if (!row) {
+      throw new NotFoundError(`Chunk ${firstIndex + offset} of content "${contentId}" is missing`);
+    }
     const chunkStart = (firstIndex + offset) * chunkSize;
     const localStart = Math.max(0, start - chunkStart);
     const localEnd = Math.min(row.data.size, end - chunkStart);
@@ -117,46 +144,57 @@ export async function readChunkRange(
   return new Blob(parts, { type: mime });
 }
 
-/** Number of chunks currently stored for a file. */
-export function countChunks(
-  transaction: IDBTransaction,
-  wait: Wait,
-  fileId: string,
-): Promise<number> {
-  const index = transaction.objectStore(STORE_CHUNKS).index(CHUNK_INDEX.fileId);
-  return wait(index.count(IDBKeyRange.only(fileId)));
-}
-
-/** Deletes every chunk belonging to a file. */
+/** Deletes every chunk belonging to a content id. */
 export async function deleteChunks(
   transaction: IDBTransaction,
   wait: Wait,
-  fileId: string,
+  contentId: string,
 ): Promise<void> {
   const store = transaction.objectStore(STORE_CHUNKS);
-  const index = store.index(CHUNK_INDEX.fileId);
-  const keys = await collectChunkKeys(index, fileId);
+  const keys = await collectChunkKeys(store.index(CHUNK_INDEX.contentId), contentId);
   await Promise.all(keys.map((key) => wait(store.delete(key))));
 }
 
-/** Deletes chunks for many files in one pass, used by bulk delete and trash purge. */
-export async function deleteChunksForMany(
-  transaction: IDBTransaction,
-  wait: Wait,
-  fileIds: readonly string[],
-): Promise<void> {
-  const store = transaction.objectStore(STORE_CHUNKS);
-  const index = store.index(CHUNK_INDEX.fileId);
-  for (const fileId of fileIds) {
-    const keys = await collectChunkKeys(index, fileId);
-    await Promise.all(keys.map((key) => wait(store.delete(key))));
-  }
+/**
+ * Every distinct content id held in the chunk store.
+ *
+ * Reads index keys only, so it never loads a chunk's bytes. Used by the sweep that
+ * removes content no record references.
+ */
+export function listContentIds(transaction: IDBTransaction): Promise<string[]> {
+  const index = transaction.objectStore(STORE_CHUNKS).index(CHUNK_INDEX.contentId);
+  return new Promise<string[]>((resolve, reject) => {
+    const seen = new Set<string>();
+    // A key cursor yields the *index* key, which is the content id. `getAllKeys` on an
+    // index yields primary keys instead, which for this store are [contentId, index].
+    const request = index.openKeyCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        resolve([...seen]);
+        return;
+      }
+      seen.add(String(cursor.key));
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error ?? new Error('Reading content ids failed'));
+  });
 }
 
-function collectChunkKeys(index: IDBIndex, fileId: string): Promise<IDBValidKey[]> {
+/** Chunks of one content id, ordered by index so reassembly is correct. */
+async function readContentChunks(
+  transaction: IDBTransaction,
+  contentId: string,
+): Promise<StoredChunk[]> {
+  const index = transaction.objectStore(STORE_CHUNKS).index(CHUNK_INDEX.contentId);
+  const rows = await collectFromCursor<StoredChunk>(index, IDBKeyRange.only(contentId), 'next');
+  return rows.sort((a, b) => a.index - b.index);
+}
+
+function collectChunkKeys(index: IDBIndex, contentId: string): Promise<IDBValidKey[]> {
   return new Promise<IDBValidKey[]>((resolve, reject) => {
     const keys: IDBValidKey[] = [];
-    const request = index.openKeyCursor(IDBKeyRange.only(fileId));
+    const request = index.openKeyCursor(IDBKeyRange.only(contentId));
     request.onsuccess = () => {
       const cursor = request.result;
       if (!cursor) {
