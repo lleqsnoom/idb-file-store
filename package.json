@@ -1,0 +1,67 @@
+{
+  "name": "idb-file-store",
+  "version": "0.1.0",
+  "description": "A queryable, local-first file database for the browser. Store, search, filter and manage images, video, audio, documents and any other user files with IndexedDB - no server required.",
+  "keywords": [
+    "indexeddb",
+    "idb",
+    "file-storage",
+    "blob-storage",
+    "browser-storage",
+    "client-side",
+    "offline",
+    "local-first",
+    "file-system",
+    "search",
+    "typescript"
+  ],
+  "license": "MIT",
+  "author": "lleqsnoom",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lleqsnoom/idb-file-store.git"
+  },
+  "homepage": "https://github.com/lleqsnoom/idb-file-store#readme",
+  "bugs": {
+    "url": "https://github.com/lleqsnoom/idb-file-store/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "example": "vite examples/playground",
+    "example:build": "vite build examples/playground",
+    "check": "npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0",
+    "vitest": "^2.1.0"
+  }
+}

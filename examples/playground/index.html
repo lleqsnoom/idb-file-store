@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>idb-file-store playground</title>
+    <meta
+      name="description"
+      content="A local file manager demo built with idb-file-store and IndexedDB."
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <strong>idb-file-store</strong>
+        <span>Local file manager, 100% in your browser</span>
+      </div>
+      <button id="sample" type="button">Add sample files</button>
+      <button id="reset" class="danger" type="button">Erase everything</button>
+    </header>
+
+    <div class="layout">
+      <aside>
+        <div id="drop" role="button" tabindex="0">
+          <strong>Drop files here</strong>
+          <span>or click to choose. Images, video, audio, text, anything.</span>
+        </div>
+        <input id="picker" type="file" multiple hidden />
+
+        <fieldset>
+          <legend>Filters</legend>
+          <label>
+            Name contains
+            <input id="f-name" type="search" placeholder="beach" />
+          </label>
+          <label>
+            Tag
+            <select id="f-tag">
+              <option value="">Any tag</option>
+            </select>
+          </label>
+          <label>
+            Size at least (KB)
+            <input id="f-size" type="number" min="0" step="1" placeholder="0" />
+          </label>
+          <label>
+            Folder
+            <select id="f-folder">
+              <option value="">Any folder</option>
+            </select>
+          </label>
+          <label>
+            <input id="f-favorite" type="checkbox" /> Favourites only
+          </label>
+          <label>
+            <input id="f-trash" type="checkbox" /> Trash only
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Types</legend>
+          <div id="kinds" class="chips"></div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Storage</legend>
+          <div class="stat-grid">
+            <div class="stat"><b id="s-count">0</b><span>files</span></div>
+            <div class="stat"><b id="s-size">0 B</b><span>stored</span></div>
+            <div class="stat"><b id="s-trash">0</b><span>in trash</span></div>
+            <div class="stat"><b id="s-quota">n/a</b><span>quota</span></div>
+          </div>
+          <div class="meter"><i id="s-meter" style="width: 0%"></i></div>
+          <button id="empty-trash" type="button" style="width: 100%; margin-top: 10px">
+            Empty trash
+          </button>
+        </fieldset>
+      </aside>
+
+      <main>
+        <div class="toolbar">
+          <input
+            id="search"
+            type="search"
+            placeholder="Search names, tags, notes and text"
+            style="min-width: 260px; flex: 1"
+          />
+          <select id="sort">
+            <option value="createdAt:desc">Newest first</option>
+            <option value="createdAt:asc">Oldest first</option>
+            <option value="name:asc">Name A-Z</option>
+            <option value="name:desc">Name Z-A</option>
+            <option value="size:desc">Largest first</option>
+            <option value="size:asc">Smallest first</option>
+            <option value="updatedAt:desc">Recently changed</option>
+          </select>
+          <select id="limit">
+            <option value="24">24 per page</option>
+            <option value="48">48 per page</option>
+            <option value="96">96 per page</option>
+          </select>
+          <button id="layout" type="button">Grid</button>
+        </div>
+
+        <div class="toolbar">
+          <span id="count" class="count">Loading</span>
+          <span class="spacer"></span>
+          <button id="more" type="button" hidden>Load more</button>
+        </div>
+
+        <div id="files" class="files" aria-live="polite"></div>
+      </main>
+    </div>
+
+    <dialog id="viewer">
+      <div class="dialog-head">
+        <h2 id="v-title"></h2>
+        <span class="spacer" style="margin-left: auto"></span>
+        <button id="v-download" type="button">Download</button>
+        <button id="v-favorite" type="button">Favourite</button>
+        <button id="v-tag" type="button">Tag</button>
+        <button id="v-rename" type="button">Rename</button>
+        <button id="v-trash" class="danger" type="button">Trash</button>
+        <button id="v-close" type="button">Close</button>
+      </div>
+      <div class="dialog-body">
+        <div id="v-preview" class="preview"></div>
+        <div>
+          <dl id="v-meta"></dl>
+          <label>
+            Notes
+            <input id="v-notes" type="text" placeholder="Add a note" />
+          </label>
+        </div>
+      </div>
+    </dialog>
+
+    <div id="toasts" role="status" aria-live="polite"></div>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
