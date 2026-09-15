@@ -13,6 +13,11 @@ import type { FileKind, JsonValue } from '../types.js';
 /** Internal record stored in the `files` object store. */
 export interface StoredFile {
   id: string;
+  /**
+   * Key of the stored bytes. Equal to `hash` whenever a hash exists, and a private id
+   * otherwise, so identical payloads collide while unhashed payloads stay independent.
+   */
+  contentId: string;
   name: string;
   nameLower: string;
   kind: FileKind;
@@ -42,9 +47,9 @@ export interface StoredFile {
   revision: number;
 }
 
-/** A chunk of file bytes. Keyed by `[fileId, index]`. */
+/** A chunk of file bytes. Keyed by `[contentId, index]`. */
 export interface StoredChunk {
-  fileId: string;
+  contentId: string;
   index: number;
   data: Blob;
 }

@@ -52,6 +52,7 @@ const controls = {
 const stats = {
   count: el<HTMLElement>('#s-count'),
   size: el<HTMLElement>('#s-size'),
+  physical: el<HTMLElement>('#s-physical'),
   trash: el<HTMLElement>('#s-trash'),
   quota: el<HTMLElement>('#s-quota'),
   meter: el<HTMLElement>('#s-meter'),
@@ -296,6 +297,11 @@ async function refreshSidebar(): Promise<void> {
 
     stats.count.textContent = String(storage.count);
     stats.size.textContent = formatBytes(storage.size);
+    stats.physical.textContent = formatBytes(storage.physicalSize);
+    stats.physical.title =
+      storage.sharedBytes > 0
+        ? `${formatBytes(storage.sharedBytes)} saved by records sharing identical content`
+        : 'nothing shared yet';
     stats.trash.textContent = `${storage.trashedCount} (${formatBytes(storage.trashedSize)})`;
     controls.emptyTrash.disabled = storage.trashedCount === 0;
 

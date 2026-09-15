@@ -52,8 +52,8 @@ Construct one instance per database name and share it across your app.
 | `generateThumbnails` | `boolean` | `true` | Generate previews for images. |
 | `thumbnailMaxSize` | `number` | `256` | Longest edge of a preview, in pixels. |
 | `computeHash` | `boolean` | `true` | Hash payloads on write. |
-| `hashMaxBytes` | `number` | `64 * 1024 * 1024` | Skip hashing above this size. |
-| `dedupe` | `boolean` | `false` | Return an existing record instead of storing identical bytes again. |
+| `hashMaxBytes` | `number` | `Infinity` | Skip hashing above this size. Sharing identical bytes needs a hash, so the default hashes everything; `computeHash: false` opts out and gives up sharing. |
+| `dedupe` | `boolean` | `false` | Return an existing record instead of creating a second one. Independent of content sharing, which is automatic. |
 | `syncTabs` | `boolean` | `true` | Broadcast changes to other tabs. |
 | `indexedDB` | `IDBFactory` | `globalThis.indexedDB` | Injectable factory, useful in tests. |
 
@@ -177,8 +177,11 @@ See [AddOptions](#addoptions) for every option.
 
 - Throws `ValidationError` when the name is empty, the id already exists, tags or
   metadata are unusable, or `chunkSize` is not positive.
-- With `dedupe: true` and a computed hash, an existing live record with the same
-  bytes is returned instead of writing a copy, and the `duplicate` event fires.
+- Identical bytes are stored once. A second record with the same content gets the same
+  `contentId` and references the existing copy rather than writing another.
+- With `dedupe: true` and a computed hash, an existing live record with the same bytes is
+  returned instead, and the `duplicate` event fires. `dedupe` decides whether a second
+  *record* is created; sharing decides where its bytes live.
 - With `id` supplied, that id is used; otherwise a UUID is generated.
 
 #### `await db.addMany(inputs, options?) => Promise<FileRecord[]>`
@@ -412,6 +415,8 @@ What `add`, `get`, `list` and friends return.
 ```ts
 interface FileRecord {
   id: string;
+  contentId: string;         // key the bytes are stored under
+
   name: string;
   kind: FileKind;
   mime: string;
@@ -581,7 +586,9 @@ detail.
 ```ts
 interface StorageStats {
   count: number;
-  size: number;
+  size: number;          // logical: the sum of record sizes
+  physicalSize: number;  // bytes actually held in the chunk store
+  sharedBytes: number;   // size - physicalSize
   trashedCount: number;
   trashedSize: number;
   byKind: Record<string, { count: number; size: number }>;

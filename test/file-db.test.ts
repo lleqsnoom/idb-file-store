@@ -8,6 +8,116 @@ import {
 } from '../src/index.js';
 import { bytesOf, makeBlob, openDb, textOf } from './setup.js';
 
+/** Number of chunks stored for a content id, read straight from the store. */
+async function chunkCountFor(db: FileDB, contentId: string): Promise<number> {
+  return db.transaction('chunks', 'readonly', async (tx, wait) =>
+    wait(
+      tx.objectStore('chunks').index('by_content').count(IDBKeyRange.only(contentId)),
+    ),
+  );
+}
+
+/**
+ * Builds a database the way schema version 1 wrote it: chunks keyed by record id.
+ *
+ * The library always opens at the current version, so an upgrade can only be exercised
+ * against a fixture created with raw IndexedDB calls.
+ */
+async function seedVersionOne(
+  factory: IDBFactory,
+  name: string,
+  entries: ReadonlyArray<{ name: string; hash: string | null; bytes: ArrayBuffer }>,
+): Promise<void> {
+  const open = factory.open(name, 1);
+  await new Promise<void>((resolve, reject) => {
+    open.onupgradeneeded = () => {
+      const db = open.result;
+      const files = db.createObjectStore('files', { keyPath: 'id' });
+      // Every index version 1 created, except the content index that version 2 adds.
+      files.createIndex('by_name', 'nameLower', { unique: false });
+      files.createIndex('by_kind', 'kind', { unique: false });
+      files.createIndex('by_mime', 'mime', { unique: false });
+      files.createIndex('by_extension', 'extension', { unique: false });
+      files.createIndex('by_size', 'size', { unique: false });
+      files.createIndex('by_created', 'createdAt', { unique: false });
+      files.createIndex('by_updated', 'updatedAt', { unique: false });
+      files.createIndex('by_accessed', 'accessedAt', { unique: false });
+      files.createIndex('by_folder', 'folder', { unique: false });
+      files.createIndex('by_tags', 'tags', { unique: false, multiEntry: true });
+      files.createIndex('by_favorite', 'favorite', { unique: false });
+      files.createIndex('by_deleted', 'deletedAt', { unique: false });
+      files.createIndex('by_hash', 'hash', { unique: false });
+      const chunks = db.createObjectStore('chunks', { keyPath: ['fileId', 'index'] });
+      chunks.createIndex('by_file', 'fileId', { unique: false });
+      db.createObjectStore('thumbnails', { keyPath: 'id' });
+      db.createObjectStore('meta', { keyPath: 'key' });
+    };
+    open.onsuccess = () => {
+      // Leaving this connection open would block the library's upgrade to version 2.
+      open.result.close();
+      resolve();
+    };
+    open.onerror = () => reject(open.error);
+  });
+
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = factory.open(name, 1);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+
+  const tx = db.transaction(['files', 'chunks'], 'readwrite');
+  for (const [offset, entry] of entries.entries()) {
+    const id = `v1-record-${offset}`;
+    const chunkSize = 16;
+    const blob = new Blob([entry.bytes]);
+    const chunkCount = Math.max(1, Math.ceil(blob.size / chunkSize));
+    tx.objectStore('files').put({
+      id,
+      name: entry.name,
+      nameLower: entry.name.toLowerCase(),
+      kind: 'other',
+      mime: 'application/octet-stream',
+      extension: 'bin',
+      size: blob.size,
+      createdAt: 1_000,
+      updatedAt: 1_000,
+      accessedAt: 1_000,
+      hash: entry.hash,
+      tags: [],
+      folder: '/',
+      favorite: 0,
+      deletedAt: 0,
+      notes: '',
+      text: '',
+      notesLower: '',
+      textLower: '',
+      tagsLower: '',
+      metaText: '',
+      width: null,
+      height: null,
+      durationMs: null,
+      chunkCount,
+      chunkSize,
+      metadata: {},
+      revision: 1,
+    });
+    for (let index = 0; index < chunkCount; index += 1) {
+      tx.objectStore('chunks').put({
+        fileId: id,
+        index,
+        data: blob.slice(index * chunkSize, (index + 1) * chunkSize),
+      });
+    }
+  }
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+  db.close();
+}
+
 describe('FileDB lifecycle', () => {
   it('opens lazily and reports its state', async () => {
     const db = new FileDB({ name: 'lifecycle', syncTabs: false });
@@ -67,6 +177,31 @@ describe('add', () => {
     db.close();
   });
 
+  it('keys identical bytes under one content id', async () => {
+    const db = await openDb();
+    const source = makeBlob(4096, 'application/octet-stream');
+
+    const first = await db.add(source, { name: 'a.bin' });
+    const second = await db.add(source, { name: 'b.bin' });
+
+    expect(first.contentId).toBe(first.hash);
+    expect(second.contentId).toBe(first.contentId);
+    expect(await bytesOf(await db.getBlob(first.id))).toEqual(await bytesOf(source));
+    expect(await bytesOf(await db.getBlob(second.id))).toEqual(await bytesOf(source));
+    db.close();
+  });
+
+  it('reports a content id even when no hash was computed', async () => {
+    const db = await openDb({ computeHash: false });
+    const first = await db.add('same bytes', { name: 'a.txt' });
+    const second = await db.add('same bytes', { name: 'b.txt' });
+
+    expect(first.hash).toBeNull();
+    expect(first.contentId).toBeTruthy();
+    expect(second.contentId).not.toBe(first.contentId);
+    db.close();
+  });
+
   it('splits large payloads into chunks and reassembles them', async () => {
     const db = await openDb({ chunkSize: 16 });
     const source = makeBlob(70, 'application/octet-stream');
@@ -77,6 +212,52 @@ describe('add', () => {
     expect(await bytesOf(await db.getBlob(record.id))).toEqual(await bytesOf(source));
     db.close();
   });
+
+  it('adopts the existing layout instead of rewriting shared content', async () => {
+    const db = await openDb();
+    const source = makeBlob(4096, 'application/octet-stream');
+
+    const first = await db.add(source, { name: 'a.bin', chunkSize: 2048 });
+    const second = await db.add(source, { name: 'b.bin', chunkSize: 512 });
+
+    expect(first.chunkCount).toBe(2);
+    expect(first.chunkSize).toBe(2048);
+    // The second add asked for 512-byte chunks but the content already exists, so it
+    // must reuse the stored layout rather than rewrite it into eight chunks.
+    expect(second.chunkCount).toBe(2);
+    expect(second.chunkSize).toBe(2048);
+    expect(await bytesOf(await db.getBlob(second.id))).toEqual(await bytesOf(source));
+    db.close();
+  });
+
+  it('replaces orphaned content rather than mixing two layouts', async () => {
+    const db = await openDb();
+    const source = makeBlob(4096, 'application/octet-stream');
+    const record = await db.add(source, { name: 'a.bin', chunkSize: 512 });
+    expect(record.chunkCount).toBe(8);
+
+    // Delete the record but leave its chunks, then re-add the same bytes at a wider
+    // chunk size. Stale chunks from the old layout must not survive the write.
+    await db.transaction('files', 'readwrite', async (tx, wait) => {
+      await wait(tx.objectStore('files').delete(record.id));
+    });
+
+    const again = await db.add(source, { name: 'b.bin', chunkSize: 4096 });
+    expect(again.chunkCount).toBe(1);
+    expect(await bytesOf(await db.getBlob(again.id))).toEqual(await bytesOf(source));
+    expect(await db.pruneOrphans()).toBe(0);
+    db.close();
+  });
+
+  it('hashes payloads larger than the old 64 MiB ceiling', async () => {
+    const db = await openDb();
+    const large = makeBlob(66 * 1024 * 1024, 'application/octet-stream');
+    const record = await db.add(large, { name: 'big.bin' });
+
+    expect(record.hash).toMatch(/^sha256:/);
+    expect(record.contentId).toBe(record.hash);
+    db.close();
+  }, 30_000);
 
   it('reads a byte range without touching the whole file', async () => {
     const db = await openDb({ chunkSize: 8 });
@@ -364,6 +545,93 @@ describe('delete, trash and restore', () => {
     db.close();
   });
 
+  it('frees shared content only when its last reference goes', async () => {
+    const db = await openDb();
+    const source = makeBlob(4096, 'application/octet-stream');
+    const first = await db.add(source, { name: 'a.bin' });
+    const second = await db.add(source, { name: 'b.bin' });
+
+    expect(await db.purge([first.id])).toBe(1);
+    expect(await bytesOf(await db.getBlob(second.id))).toEqual(await bytesOf(source));
+
+    expect(await db.purge([second.id])).toBe(1);
+    expect(await db.pruneOrphans()).toBe(0);
+    db.close();
+  });
+
+  it('keeps content alive while a trashed record still references it', async () => {
+    const db = await openDb();
+    const source = makeBlob(2048, 'application/octet-stream');
+    const live = await db.add(source, { name: 'a.bin' });
+    const trashed = await db.add(source, { name: 'b.bin' });
+    await db.trash([trashed.id]);
+
+    await db.purge([live.id]);
+    expect(await bytesOf(await db.getBlob(trashed.id))).toEqual(await bytesOf(source));
+    db.close();
+  });
+
+  it('empties the trash without freeing content a live record still uses', async () => {
+    const db = await openDb();
+    const source = makeBlob(1024, 'application/octet-stream');
+    const live = await db.add(source, { name: 'a.bin' });
+    const trashed = await db.add(source, { name: 'b.bin' });
+    await db.trash([trashed.id]);
+
+    expect(await db.emptyTrash()).toBe(1);
+    expect(await bytesOf(await db.getBlob(live.id))).toEqual(await bytesOf(source));
+    db.close();
+  });
+
+  it('releases the old content when an update replaces unshared bytes', async () => {
+    const db = await openDb();
+    const record = await db.add(makeBlob(1024, 'application/octet-stream'), { name: 'a.bin' });
+    const previousContent = record.contentId;
+
+    await db.update(record.id, { data: makeBlob(2048, 'application/octet-stream') });
+
+    expect(await chunkCountFor(db, previousContent)).toBe(0);
+    expect(await db.getBlob(record.id)).toBeInstanceOf(Blob);
+    db.close();
+  });
+
+  it('keeps the old content when an update replaces shared bytes', async () => {
+    const db = await openDb();
+    const source = makeBlob(1024, 'application/octet-stream');
+    const first = await db.add(source, { name: 'a.bin' });
+    const second = await db.add(source, { name: 'b.bin' });
+
+    await db.update(first.id, { data: makeBlob(2048, 'application/octet-stream') });
+
+    expect(await chunkCountFor(db, second.contentId)).toBeGreaterThan(0);
+    expect(await bytesOf(await db.getBlob(second.id))).toEqual(await bytesOf(source));
+    db.close();
+  });
+
+  it('reports logical and physical storage', async () => {
+    const db = await openDb();
+    const source = makeBlob(4 * 1024 * 1024, 'application/octet-stream');
+    await db.add(source, { name: 'a.bin' });
+    await db.add(source, { name: 'b.bin' });
+
+    const stats = await db.stats();
+    expect(stats.size).toBe(8 * 1024 * 1024);
+    expect(stats.physicalSize).toBe(4 * 1024 * 1024);
+    expect(stats.sharedBytes).toBe(4 * 1024 * 1024);
+    db.close();
+  });
+
+  it('reports zero shared bytes when nothing is shared', async () => {
+    const db = await openDb();
+    await db.add(makeBlob(1024, 'application/octet-stream'), { name: 'a.bin' });
+    await db.add(makeBlob(2048, 'application/octet-stream'), { name: 'b.bin' });
+
+    const stats = await db.stats();
+    expect(stats.physicalSize).toBe(stats.size);
+    expect(stats.sharedBytes).toBe(0);
+    db.close();
+  });
+
   it('clears everything but keeps the database usable', async () => {
     const db = await openDb();
     await db.add('a', { name: 'a.txt' });
@@ -389,11 +657,90 @@ describe('delete, trash and restore', () => {
     db.close();
   });
 
+  it('sweeps unreferenced content and keeps what a trashed record holds', async () => {
+    const db = await openDb({ chunkSize: 16 });
+    // Distinct sizes, so each record owns its own content.
+    const kept = await db.add(makeBlob(64, 'application/octet-stream'), { name: 'kept.bin' });
+    const doomed = await db.add(makeBlob(48, 'application/octet-stream'), { name: 'doomed.bin' });
+    await db.trash([doomed.id]);
+    const orphan = await db.add(makeBlob(32, 'application/octet-stream'), { name: 'orphan.bin' });
+
+    // Delete the record out of band, leaving its content behind.
+    await db.transaction('files', 'readwrite', async (tx, wait) => {
+      await wait(tx.objectStore('files').delete(orphan.id));
+    });
+
+    expect(await db.pruneOrphans()).toBe(2);
+    // The trashed record still references its content, so that content survives.
+    expect(await chunkCountFor(db, kept.contentId)).toBe(4);
+    expect(await chunkCountFor(db, doomed.contentId)).toBe(3);
+    expect(await chunkCountFor(db, orphan.contentId)).toBe(0);
+
+    expect(await db.pruneOrphans()).toBe(0);
+    db.close();
+  });
+
   it('destroys the whole database', async () => {
     const db = await openDb();
     await db.add('a', { name: 'a.txt' });
     await db.destroy();
     expect(db.isOpen).toBe(false);
+  });
+});
+
+describe('schema migration', () => {
+  it('rekeys chunks written by schema version 1', async () => {
+    const factory = new IDBFactory();
+    const name = 'v1-fixture';
+    const bytes = await makeBlob(64).arrayBuffer();
+    await seedVersionOne(factory, name, [
+      { name: 'a.bin', hash: 'sha256:aaa', bytes },
+      { name: 'b.bin', hash: 'sha256:bbb', bytes },
+    ]);
+
+    const db = await FileDB.open({ name, indexedDB: factory, syncTabs: false });
+    const page = await db.all({ sort: { by: 'name' } });
+
+    expect(page).toHaveLength(2);
+    expect(page[0]?.contentId).toBe('sha256:aaa');
+    expect(page[1]?.contentId).toBe('sha256:bbb');
+    for (const record of page) {
+      expect((await db.getBlob(record.id)).size).toBe(64);
+    }
+    expect((await db.stats()).physicalSize).toBe(128);
+    db.close();
+  });
+
+  it('shares one content id between v1 records that had the same hash', async () => {
+    const factory = new IDBFactory();
+    const name = 'v1-shared';
+    const bytes = await makeBlob(48).arrayBuffer();
+    await seedVersionOne(factory, name, [
+      { name: 'a.bin', hash: 'sha256:same', bytes },
+      { name: 'b.bin', hash: 'sha256:same', bytes },
+    ]);
+
+    const db = await FileDB.open({ name, indexedDB: factory, syncTabs: false });
+    const page = await db.all({ sort: { by: 'name' } });
+
+    expect(new Set(page.map((record) => record.contentId)).size).toBe(1);
+    expect(await chunkCountFor(db, 'sha256:same')).toBe(3);
+    expect((await db.getBlob(page[1]?.id as string)).size).toBe(48);
+    db.close();
+  });
+
+  it('keeps unhashed v1 records under their own id', async () => {
+    const factory = new IDBFactory();
+    const name = 'v1-unhashed';
+    await seedVersionOne(factory, name, [
+      { name: 'a.bin', hash: null, bytes: await makeBlob(20).arrayBuffer() },
+    ]);
+
+    const db = await FileDB.open({ name, indexedDB: factory, syncTabs: false });
+    const page = await db.all();
+    expect(page[0]?.contentId).toBe('v1-record-0');
+    expect((await db.getBlob(page[0]?.id as string)).size).toBe(20);
+    db.close();
   });
 });
 
@@ -473,6 +820,40 @@ describe('backup and restore', () => {
 
     expect(await db.count()).toBe(0);
     expect(await db.count({ where: { deleted: true } })).toBe(1);
+    db.close();
+  });
+
+  it('preserves sharing through a backup round trip', async () => {
+    const db = await openDb();
+    const source = makeBlob(4 * 1024 * 1024, 'application/octet-stream');
+    await db.add(source, { name: 'a.bin' });
+    await db.add(source, { name: 'b.bin' });
+    const before = await db.stats();
+
+    const backup = await db.backup();
+    await db.clear();
+    await db.restoreBackup(backup);
+
+    const page = await db.all();
+    expect(page).toHaveLength(2);
+    expect(new Set(page.map((record) => record.contentId)).size).toBe(1);
+    expect((await db.stats()).physicalSize).toBe(before.physicalSize);
+    db.close();
+  });
+
+  it('recomputes hashes on restore instead of trusting the backup', async () => {
+    const db = await openDb();
+    await db.add('trustworthy bytes', { name: 'a.txt' });
+
+    const backup = await db.backup();
+    (backup.entries[0] as { record: { hash: string | null } }).record.hash = 'sha256:not-the-bytes';
+    await db.clear();
+    await db.restoreBackup(backup);
+
+    const [restored] = await db.all();
+    expect(restored?.hash).toMatch(/^sha256:/);
+    expect(restored?.hash).not.toBe('sha256:not-the-bytes');
+    expect(await db.getText(restored?.id as string)).toBe('trustworthy bytes');
     db.close();
   });
 

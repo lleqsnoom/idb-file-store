@@ -115,8 +115,8 @@ await db.purge([photo.id]);      // gone for good
 | **Sorting** | name, size, timestamps, kind, MIME, extension, folder; multi-key, natural ordering |
 | **Search** | field-weighted relevance ranking, tokenised, field allow-list, `all`/`any` modes, optional one-character typo tolerance |
 | **Pagination** | `limit` + `offset`, or opaque cursors that survive round trips |
-| **Files** | chunked storage, byte-range reads, auto MIME/kind detection, text extraction, image thumbnails and dimensions |
-| **Integrity** | SHA-256 content hashing and optional de-duplication on write |
+| **Files** | content-addressed storage, byte-range reads, auto MIME/kind detection, text extraction, image thumbnails and dimensions |
+| **Integrity** | SHA-256 content hashing, shared storage for identical bytes, optional record de-duplication |
 | **Maintenance** | trash with restore, orphan pruning, `navigator.storage` quotas, JSON snapshots, full backups |
 | **Reactivity** | typed events (`add`, `update`, `delete`, `restore`, `purge`, `change`) and cross-tab sync over `BroadcastChannel` |
 | **Extras** | object URLs, browser downloads, `File` export, storage statistics, filter facets |
@@ -136,9 +136,16 @@ metadata and revision. Bytes are **not** part of the record; ask for them with
 `{ startsWith: '/photos' }` for the whole subtree. Folders are strings, not
 entities, so you can build a tree with `facets().byFolder`.
 
-**Chunks.** The library slices every payload into fixed-size chunks on write (2 MiB
-by default, configurable per call). Deleting a file is a range delete, and
-`readRange()` loads only the chunks that overlap the requested window.
+**Chunks.** The library slices every payload into fixed-size chunks on write (2 MiB by
+default, configurable per call). Deleting a file is a range delete, and `readRange()`
+loads only the chunks that overlap the requested window.
+
+**Content.** Chunks are addressed by a content id: the payload's hash when one was
+computed, a private id otherwise. Two records whose bytes are identical therefore share
+one copy on disk, whatever names or folders you gave them. The copy goes away when the
+last record referencing it is purged, and `stats().physicalSize` reports what is really
+stored. `dedupe` is a separate choice: it refuses the second *record* rather than sharing
+its bytes.
 
 **Search columns.** Each record keeps denormalised lowercase columns for name,
 tags, folder, MIME, notes, extracted text and metadata. Search is a handful of
@@ -305,7 +312,13 @@ deliberate, and both have a cost.
 **Writes are chunked.** The library slices every payload into fixed-size chunks
 (2 MiB by default), so a large video never becomes one allocation and a seek reads
 only the chunks it overlaps. The cost lands on reads: assembling a whole file
-concatenates its chunks, and deleting one walks a range in the chunk index.
+concatenates its chunks, and deleting one walks a range in the content index.
+
+**Content is shared.** Chunks are keyed by the payload's hash, so identical bytes are
+stored once however many records point at them, and the copy is released when the last
+one is purged. The cost is one extra read: `add()` hashes the payload before opening
+the write transaction, because a transaction cannot await non-JS work, and then slices
+it. Peak memory stays at one chunk.
 
 **Queries scan candidates in memory.** IndexedDB can order by only one index and
 cannot compare case-insensitively, so ordering and relevance ranking run over the

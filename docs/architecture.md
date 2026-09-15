@@ -81,6 +81,7 @@ Keyed by `id`. Indexes:
 | `by_favorite` | `favorite` | Starred lists |
 | `by_deleted` | `deletedAt` | Trash exclusion |
 | `by_hash` | `hash` | De-duplication lookup |
+| `by_content` | `contentId` | Counting how many records reference a piece of content |
 
 Three of those deserve an explanation.
 
@@ -99,8 +100,13 @@ desired behaviour: unhashed files are never de-duplication candidates.
 
 ### `chunks` — the bytes
 
-Keyed by `[fileId, index]`, with a non-unique `by_file` index on `fileId`. See
+Keyed by `[contentId, index]`, with a non-unique `by_content` index on `contentId`. See
 below.
+
+The store is addressed by **content**, not by record: `contentId` is the payload's hash
+when one was computed and a private id otherwise. Two records with identical bytes
+resolve to the same keys and share one copy, while unhashed payloads stay independent.
+Version 1 keyed this store by record id; the version 2 upgrade rekeys it.
 
 ### `thumbnails` — generated previews
 
@@ -367,7 +373,8 @@ What the library promises, and what it does not.
 | Non-guarantee | Consequence |
 | --- | --- |
 | No cross-tab write serialisation. | Two tabs writing the same record both read, modify and put. The last commit wins and one update is lost. `change` events tell you it happened; they cannot prevent it. |
-| `dedupe` cannot prevent a concurrent duplicate. | `add()` looks up the hash in a separate transaction from the insert, so two tabs adding the same payload at the same time store it twice. There is no unique index on `hash`. |
+| Two records with identical bytes share one copy. | The content id is derived from the payload, so both writes land on the same chunk keys and the second adopts the stored layout. |
+| Two tabs adding identical content at once are harmless. | Both write identical bytes to the same keys with idempotent `put`s, and the reference count sees both records. This replaces the concurrent-duplicate gap version 1 documented. |
 | No rollback for a bad migration. | `upgradeSchema` runs inside `onupgradeneeded`. Keep a backup with `backup()` or `snapshot()` before raising `version`. |
 | No ordering guarantee for a search without `sort`. | Ranked results are ordered by score, and equal scores fall back to `sort`, then `id`. Two records with the same score can swap places unless you supply a `sort`. |
 
