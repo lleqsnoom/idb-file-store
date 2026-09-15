@@ -30,6 +30,7 @@ src/
     schema.ts                 store and index definitions, migrations
     records.ts                on-disk row shapes
     chunk-store.ts            chunked blob reads and writes
+    prepare.ts                write pipeline: detect, hash, extract, preview, map
 
   query/
     match.ts                  where-clause predicates
@@ -139,37 +140,45 @@ needed.
   ids, and removes anything unmatched. This is the safety net for a write that
   was interrupted between the chunk write and the record write.
 
-The trade-off is that `chunkCount` and `chunkSize` are recorded on the row. A
-`chunkSize` that no longer matches reality would corrupt reassembly, so the value
-is stored per record rather than read from configuration at read time: changing
-the default in a new release never breaks existing files.
+The trade-off is that the row records `chunkCount` and `chunkSize`. A `chunkSize`
+that no longer matches reality would corrupt reassembly, so each record stores its
+own rather than reading configuration at read time: changing the default in a new
+release never breaks existing files.
 
 ---
 
 ## Why records carry denormalised columns
 
-The row keeps lowercase copies of the searchable fields (`nameLower`,
-`tagsLower`, `notesLower`, `textLower`, `metaText`), their union
-(`searchText`), and a tokenised version (`searchTokens`).
+The row keeps one lowercase column per searchable field: `nameLower`,
+`tagsLower`, `notesLower`, `textLower` and `metaText`.
 
 An alternative is to compute those at query time, and a third option is a
 separate inverted index. The denormalised columns won:
 
 - IndexedDB cannot sort or compare case-insensitively, so `nameLower` is needed
   regardless for correct ordering.
-- `searchText` makes ranking a handful of `indexOf` calls per candidate instead
-  of rebuilding the same strings for every query.
+- A lowercase column turns ranking into a handful of `indexOf` calls per candidate,
+  instead of rebuilding the same strings for every query.
 - A separate inverted index would need its own store, its own write path and its
-  own consistency story, for a feature that is already fast enough in memory.
-- `search.fields` still works because each field keeps its own column, rather than
-  one merged blob.
+  own consistency story, for a feature that is fast enough in memory.
+- `search.fields` works because each field keeps its own column, rather than one
+  merged blob.
 
-The cost is a modest increase in row size and one `buildSearchColumns()` call per
-write, which is the right trade for a read-heavy, write-light workload.
+**Measured cost.** Storing a 3,149-byte text file produces 3,188 bytes of
+denormalised columns, and the whole row is 6,931 bytes, so a text-heavy record
+costs about 2.2 times its payload. Reproduce it with
+`.x-skills/measure/row-size.mjs`, which reports the per-column breakdown.
 
-Note that the denormalised `searchText` is capped: a huge extracted `text` field
-is truncated in the search columns while `text` itself keeps the full value up to
-`maxTextBytes`.
+An earlier design also stored a merged copy of every column (`searchText`) and a
+tokenised array of it (`searchTokens`). Measurement showed those two accounted for
+7,757 of those 3,149 payload bytes' worth of overhead, growing rows to 4.7 times
+the payload, while **nothing read them**: the ranker reads the per-field columns
+directly, and the default "search everywhere" path is just the full set of them.
+Both were removed.
+
+The `text` column is the exception to the sizing rule: extraction stops at
+`maxTextBytes` (256 KiB by default), so indexing a large document stores a
+truncated copy rather than the whole thing.
 
 ---
 
@@ -254,8 +263,8 @@ distinguishes library failures from application ones. `NotFoundError` is used bo
 for missing records and for missing bytes, since from the caller's point of view
 they are the same situation: the data is not there.
 
-Listener exceptions are isolated. A broken `add` listener is logged and skipped so
-that observing a write cannot fail the write.
+The library isolates listener exceptions: it logs a broken `add` listener and skips
+it, so observing a write cannot fail the write.
 
 ---
 
@@ -266,7 +275,7 @@ Each `FileDB` instance holds one connection and, by default, one
 
 - Local mutations emit their typed event, then a `change` event with
   `remote: false`, then post to the channel.
-- Incoming messages are ignored when `source` matches the instance id, so a
+- The library ignores an incoming message whose `source` matches its own id, so a
   single tab does not echo its own writes.
 - Remote changes only produce `change` events with `remote: true`. Listeners that
   mutate in response to `change` should check the flag to avoid loops.
@@ -314,8 +323,8 @@ Rules that keep upgrades safe:
 ## Deliberate non-goals
 
 **Transactional commit protocols.** IndexedDB guarantees that a transaction
-either commits or rolls back. Everything that fails can be attempted again; there
-is no partial-write recovery to design.
+either commits or rolls back. A caller can retry anything that fails; there is no
+partial-write recovery to design.
 
 **A server sync layer.** The library is local-first by design. Sync is an
 application decision, and `snapshot()`, `backup()`, `change` events and `revision`
@@ -332,3 +341,63 @@ predictable and correct.
 **A file tree UI.** Folders are paths, not entities, which keeps the storage
 model simple. The shape of the tree is a presentation concern: `facets().byFolder`
 gives you the data to draw one, and `recipes.md` shows how.
+
+---
+
+## Guarantees and non-guarantees
+
+What the library promises, and what it does not.
+
+| Guarantee | Held by |
+| --- | --- |
+| A record, its chunks and its thumbnail commit or roll back together. | One transaction per write; the pipeline in `prepare.ts` runs before the transaction opens. |
+| Ordering is total, so pagination is stable. | `compareRecords` falls back to `id` when every sort field ties. |
+| `revision` increases on every write to a record. | `add()` starts at 1; `update()` and `#patch` increment it. |
+| Filtering is correct whatever index the planner chooses. | The predicate pass always runs after the indexed scan. |
+| Trashed records keep their bytes until purged. | `trash()` sets `deletedAt`; only `purge()` and `emptyTrash()` delete chunks. |
+
+| Non-guarantee | Consequence |
+| --- | --- |
+| No cross-tab write serialisation. | Two tabs writing the same record both read, modify and put. The last commit wins and one update is lost. `change` events tell you it happened; they cannot prevent it. |
+| `dedupe` cannot prevent a concurrent duplicate. | `add()` looks up the hash in a separate transaction from the insert, so two tabs adding the same payload at the same time store it twice. There is no unique index on `hash`. |
+| No rollback for a bad migration. | `upgradeSchema` runs inside `onupgradeneeded`. Keep a backup with `backup()` or `snapshot()` before raising `version`. |
+| No ordering guarantee for a search without `sort`. | Ranked results are ordered by score, and equal scores fall back to `sort`, then `id`. Two records with the same score can swap places unless you supply a `sort`. |
+
+---
+
+## Why not SQLite-WASM or OPFS?
+
+The same problem has real alternatives, and they are the right answer in some
+cases.
+
+| | This library | SQLite-WASM + OPFS |
+| --- | --- | --- |
+| Payload | Plain JavaScript, no binary | A WASM build plus the app's own bundle |
+| Threading | Works on any thread | Needs a worker to avoid blocking, and OPFS needs specific headers |
+| Query language | A typed query object | SQL |
+| Joins and aggregates | Not supported | Supported |
+| Schema | Managed by `SCHEMA_VERSION` and additive steps | Managed by SQL migrations |
+| Storage API | IndexedDB, available on every origin | OPFS, not available everywhere and restricted on some origins |
+
+Reach for SQLite-WASM when you need joins, aggregates over millions of rows, or a
+schema shared with a server database. Reach for this when you want a local file
+library with search, filters and previews, without shipping a second runtime.
+
+---
+
+## References
+
+Platform behaviour this design depends on, verified against the primary sources:
+
+- IndexedDB key types (booleans, `null` and `undefined` are not keys) and the rule
+  that a record whose indexed value is not a key is stored but omitted from that
+  index: <https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API/Basic_Terminology>
+- Transaction lifetime ("If you return to the event loop without using it then the
+  transaction will become inactive"): <https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API/Using_IndexedDB>
+- `structuredClone` support, which sets the browser floor:
+  <https://developer.mozilla.org/en-US/docs/Web/API/structuredClone>
+- `BroadcastChannel` and `createImageBitmap` support, which set the floors for the
+  optional features: <https://developer.mozilla.org/en-US/docs/Web/API/BroadcastChannel>,
+  <https://developer.mozilla.org/en-US/docs/Web/API/Window/createImageBitmap>
+- `OffscreenCanvas` support, which decides whether preview rendering needs a DOM:
+  <https://developer.mozilla.org/en-US/docs/Web/API/OffscreenCanvas>

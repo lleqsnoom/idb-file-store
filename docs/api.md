@@ -447,20 +447,34 @@ interface FileRecord {
 `spreadsheet`, `presentation`, `archive`, `code`, `font`, `other`; the exported
 `FILE_KINDS` array lists them all in a stable order.
 
+### MutableFileFields
+
+The fields a caller may set on a record, whether creating or changing it.
+`AddOptions` and `UpdateOptions` both extend this interface, so anything listed
+here works in either call.
+
+| Option | Type | Meaning |
+| --- | --- | --- |
+| `name` | `string` | Display name, derived from `File.name` then the MIME type when omitted. |
+| `mime` | `string` | Overrides detection. |
+| `kind` | `FileKind` | Overrides detection. |
+| `tags` | `string[]` | Replaces the tag list. |
+| `folder` | `string` | Normalised to `/a/b` form. |
+| `favorite` | `boolean` | Stars or unstars. |
+| `notes` | `string` | Searchable notes. |
+| `metadata` | `Record<string, JsonValue>` | Structured data; must survive a JSON round trip. |
+| `updatedAt` | `number \| Date` | Overrides the modification time. |
+| `width`, `height` | `number \| null` | Known pixel size; `null` clears it. |
+| `durationMs` | `number \| null` | Known media duration; `null` clears it. |
+
 ### AddOptions
+
+Everything in [MutableFileFields](#mutablefilefields), plus:
 
 | Option | Type | Meaning |
 | --- | --- | --- |
 | `id` | `string` | Explicit id. Random UUID when omitted. |
-| `name` | `string` | Display name. Derived from `File.name`, then the MIME type. |
-| `mime` | `string` | Overrides detection. |
-| `kind` | `FileKind` | Overrides detection. |
-| `tags` | `string[]` | Initial tags, trimmed and de-duplicated case-insensitively. |
-| `folder` | `string` | Normalised to `/a/b` form. |
-| `favorite` | `boolean` | Star on creation. |
-| `notes` | `string` | Searchable notes. |
-| `metadata` | `Record<string, JsonValue>` | Structured data. Must survive a JSON round trip. |
-| `createdAt` / `updatedAt` | `number \| Date` | Override timestamps. |
+| `createdAt` | `number \| Date` | Override creation time. |
 | `text` | `string` | Supply searchable text instead of extracting it. |
 | `extractText` | `boolean` | Per-call override of the database option. |
 | `generateThumbnail` | `boolean` | Per-call override. |
@@ -475,14 +489,12 @@ interface FileRecord {
 
 ### UpdateOptions
 
-Every mutable field from `AddOptions` (`name`, `mime`, `kind`, `tags`, `folder`,
-`favorite`, `notes`, `metadata`, `updatedAt`), plus:
+Everything in [MutableFileFields](#mutablefilefields), plus:
 
 | Option | Type | Meaning |
 | --- | --- | --- |
 | `data` | `FileInput` | Replacement bytes; re-runs chunking, hashing, extraction and thumbnails. |
 | `text` | `string \| null` | Replace the searchable text; `null` clears it. |
-| `width` / `height` / `durationMs` | `number \| null` | Set or clear derived dimensions. |
 
 ### ReadOptions
 
@@ -500,7 +512,7 @@ Every mutable field from `AddOptions` (`name`, `mime`, `kind`, `tags`, `folder`,
 | `where` | `Where` | `{}` | Declarative filter. |
 | `search` | `string \| SearchQuery` | — | Full-text search, optionally ranked and scored. |
 | `sort` | `Sort \| Sort[]` | `createdAt` desc | One or more sort instructions. |
-| `limit` | `number` | `100` | Maximum items in the page. |
+| `limit` | `number` | `100` | Maximum items in the page. `Infinity` means "everything"; `Page.limit` reports the value that was applied, which is always finite. |
 | `offset` | `number` | `0` | Records to skip. Ignored when `cursor` is set. |
 | `cursor` | `string \| null` | — | Cursor from a previous `Page`. |
 | `includeBlob` / `includeText` / `includeThumbnail` | `boolean` | `false` | Attach extras to every item. |
@@ -605,7 +617,6 @@ throws.
 | `ClosedError` | A method is used before `open()`, or after `close()`. |
 | `NotSupportedError` | The runtime lacks a needed API (`indexedDB`, `URL.createObjectURL`, `File`, a canvas). |
 | `QuotaError` | The browser refused a write because storage is full. |
-| `ConflictError` | A write collided with an existing record under a unique constraint. |
 | `FileDBError` | Base class and catch-all for wrapped IndexedDB failures. |
 
 ```ts

@@ -40,7 +40,7 @@ interface Query {
 Every field is optional. `db.list()` with no arguments returns the 100 most
 recently created live records.
 
-Filters combine with **AND**. Inside a clause, alternatives are expressed with a
+Filters combine with **AND**. Inside a clause, you express alternatives with a
 list. There is no `OR` across clauses; use `where.custom` when you genuinely
 need one, or issue two queries and merge.
 
@@ -130,7 +130,7 @@ displayed.
 
 ### Metadata
 
-Metadata is matched exactly, by dotted path, on the values you stored. A list
+Metadata matches exactly, by dotted path, against the values you stored. A list
 means "any of".
 
 ```ts
@@ -185,8 +185,8 @@ Sortable fields: `name`, `size`, `createdAt`, `updatedAt`, `accessedAt`, `kind`,
 - Text fields use `Intl.Collator` with `numeric: true` and `sensitivity: 'base'`.
   That means natural order (`IMG_2` before `IMG_10`) and case/accent-insensitive
   comparison, which is what a file browser should show.
-- Sorting happens in memory after the candidates are collected; it cannot use an
-  IndexedDB index. See [Performance](#performance).
+- The library sorts in memory after collecting the candidates, because IndexedDB can
+  order by only one index at a time. See [Performance](#performance).
 
 ---
 
@@ -219,7 +219,7 @@ By default: `name`, `text`, `notes`, `tags`, `folder`, `mime`, `metadata`.
 - `metadata` covers every primitive value in the metadata tree, including the
   keys themselves.
 
-Restrict with `fields`. Restricting to `name` is a good way to build a
+Use `fields` to restrict matching. Restricting to `name` is a good way to build a
 "search filenames only" toggle.
 
 ### Tokenisation
@@ -231,7 +231,7 @@ becomes `holiday photos 2024 jpeg`, and searching `zazolc` finds `zażółć`.
 
 ### Ranking
 
-Each token is matched against each searched field and keeps its **best** hit,
+For each token, the ranker looks at every searched field and keeps the **best** hit,
 weighted by how meaningful the field is:
 
 | Field | Weight |
@@ -308,8 +308,8 @@ total.
 
 Rules:
 
-- The cursor must be produced by a query with the **same `sort`**. Reusing a
-  cursor with a different sort is a bug; a malformed one throws `ValidationError`.
+- Produce the cursor from a query with the **same `sort`**. Reusing a cursor with a
+  different sort is a bug; a malformed one throws `ValidationError`.
 - When a cursor is present, `offset` is ignored.
 - `total` is still the full match count, not the remainder.
 
@@ -327,9 +327,9 @@ for await (const record of db.iterate({ where: { kind: 'video' } })) {
 }
 ```
 
-With a `sort`, records are collected first because ordering cannot be streamed.
-Without one, primary keys are read up front and records are fetched in batches of
-250, so memory stays flat no matter how large the library is.
+With a `sort`, the library collects the records first, because it cannot stream an
+ordered result. Without one, it reads the primary keys up front and fetches records
+in batches of 250, so memory stays flat however large the library is.
 
 Abort long walks with a signal:
 
@@ -346,18 +346,19 @@ for await (const record of db.iterate({ signal: controller.signal })) {
 
 ## How a query is executed
 
-1. **Plan.** The most selective `where` clause is turned into an `IDBKeyRange`
-   against one of the indexes on `files`. If nothing can be narrowed, the scan
-   falls back to the `deleted` index so trash is skipped.
+1. **Plan.** The planner walks the `where` clauses in a fixed preference order and
+   uses the first one an index can answer, turning it into an `IDBKeyRange` against
+   one of the indexes on `files`. It is a preference order, not a cost model: no
+   statistics are consulted. If nothing can be narrowed, the scan falls back to the
+   `deleted` index so trash is skipped.
 2. **Scan.** Candidate rows are read — metadata only, never bytes.
-3. **Filter.** The remaining clauses run as predicates, in memory. Trashed
-   records are dropped here unless requested.
-4. **Score.** If `search` is present, each surviving row is ranked; rows that fail
-   the search are dropped.
-5. **Order.** Rows are sorted by score (when searching) and then by `sort`.
-6. **Page.** The cursor position is skipped, `limit` is applied, and extras
-   (`blob`, `text`, `thumbnail`) are attached in a second transaction for just the
-   page.
+3. **Filter.** The remaining clauses run as predicates, in memory. The filter drops
+   trashed records here unless you asked for them.
+4. **Score.** If `search` is present, the ranker scores each surviving row and drops
+   the ones that fail.
+5. **Order.** The ranker sorts rows by score first, then by `sort`.
+6. **Page.** The reader skips to the cursor position, applies `limit`, and attaches
+   extras (`blob`, `text`, `thumbnail`) in a second transaction for just the page.
 
 The index plan affects **speed only**. Because the predicates always run, an
 unlucky plan costs time, never correctness.
@@ -375,7 +376,7 @@ planIndex({ kind: 'image', tags: { any: ['a', 'b'] } });
 
 ## Performance
 
-**Filter on an indexed field.** These clauses are answered by an index: `id`,
+**Filter on an indexed field.** An index answers these clauses: `id`,
 `name: { eq | startsWith }`, `mime`, `extension`, `hash`, `kind`, `folder`,
 timestamps, `size`, a single `tags` entry, `favorite`, and the default
 `deleted: false`. Any of them turns a full scan into a narrow one.
@@ -384,16 +385,21 @@ timestamps, `size`, a single `tags` entry, `favorite`, and the default
 use the multi-entry tag index. An `any` list with several alternatives cannot, so
 it falls back to a scan; include another indexed clause alongside it.
 
-**Keep candidate sets sane.** Ordering and ranking are in-memory operations.
-Everything is fast well into the tens of thousands of records because rows carry
-no bytes, but if your library is larger, prefer `iterate()` for bulk work or pair
-each query with a narrowing clause.
+**Keep candidate sets sane.** Ordering and ranking run in memory, and the cost grows
+with the number of candidate rows, not with the size of the database. Rows carry no
+bytes, so the per-row cost is small, but nothing here is free: pair every query with
+an indexed clause to keep the candidate set narrow, or use `iterate()` for bulk work
+that does not need ordering.
+
+No benchmark ships with this repository, so no record counts or timings are quoted
+here. Measure your own workload with `planIndex()` (which index a query will use)
+and `facets()` (how many records a filter matches).
 
 **Ask for fewer extras.** `includeBlob` reads chunks for every item on the page.
 Fetch metadata first, then call `getBlob()` or `getObjectURL()` for what is
 actually rendered.
 
-**Reuse the planned index.** Sorting by `createdAt` while filtering on
-`kind` means results are collected then re-sorted. Sorting by the same field you
-filtered on does not help IndexedDB here (only one index drives the cursor), so
-this is expected rather than a bug.
+**Expect a second pass when you sort by something else.** Sorting by `createdAt`
+while filtering on `kind` means the library collects the matching rows and re-sorts
+them. Filtering by the same field you sort by does not avoid that here, because only
+one index can drive the cursor. This is expected, not a bug.
