@@ -22,7 +22,6 @@ import { getByPath, isInsideFolder, normalizeFolder } from '../utils/path.js';
 import { toPublicRecord } from '../utils/record.js';
 import { normalizeText } from '../utils/text.js';
 
-/** Tests a string field against a string filter. */
 export function matchesString(value: string, filter: OneOrMany<string> | StringOperators): boolean {
   if (typeof filter === 'string') return value.toLowerCase() === filter.toLowerCase();
   if (Array.isArray(filter)) {
@@ -50,11 +49,10 @@ export function matchesString(value: string, filter: OneOrMany<string> | StringO
     return false;
   }
   if (operators.notIn?.some((candidate) => candidate.toLowerCase() === lowered)) return false;
-  if (operators.regex && !operators.regex.test(value)) return false;
+  if (operators.regex && !testPattern(operators.regex, value)) return false;
   return true;
 }
 
-/** Tests a numeric field against a number filter. */
 export function matchesNumber(value: number, filter: NumberOperators): boolean {
   if (filter.eq !== undefined && value !== filter.eq) return false;
   if (filter.ne !== undefined && value === filter.ne) return false;
@@ -69,7 +67,7 @@ export function matchesNumber(value: number, filter: NumberOperators): boolean {
   return true;
 }
 
-/** Tests a timestamp field against a filter that accepts `Date` or milliseconds. */
+/** Accepts a `Date`, epoch milliseconds, or the same comparison operators as a number. */
 export function matchesTime(value: number, filter: TimeFilter): boolean {
   if (filter instanceof Date) return value === filter.getTime();
   if (typeof filter === 'number') return value === filter;
@@ -102,7 +100,6 @@ export function normalizeTimeOperators(
   return out;
 }
 
-/** Tests a tag list against a tag filter. */
 export function matchesTags(tags: readonly string[], filter: TagFilter): boolean {
   const lowered = tags.map((tag) => tag.toLowerCase());
   const has = (tag: string): boolean => lowered.includes(tag.toLowerCase());
@@ -116,7 +113,6 @@ export function matchesTags(tags: readonly string[], filter: TagFilter): boolean
   return true;
 }
 
-/** Tests a folder path against a folder filter. */
 export function matchesFolder(folder: string, filter: FolderFilter): boolean {
   if (typeof filter === 'string') return folder === normalizeFolder(filter);
   if (Array.isArray(filter)) {
@@ -128,6 +124,18 @@ export function matchesFolder(folder: string, filter: FolderFilter): boolean {
     return false;
   }
   return true;
+}
+
+/**
+ * Runs a caller-supplied pattern without letting it keep state.
+ *
+ * A `RegExp` carrying the `g` or `y` flag remembers `lastIndex` between calls, so
+ * testing the same object against successive records would match every other one.
+ * Rewinding the index first is the documented way to reuse such a pattern.
+ */
+export function testPattern(pattern: RegExp, value: string): boolean {
+  pattern.lastIndex = 0;
+  return pattern.test(value);
 }
 
 /** Deep JSON equality, used by metadata filters. */
@@ -147,29 +155,79 @@ export function deepEqualJson(a: unknown, b: JsonValue): boolean {
   return false;
 }
 
-/** Evaluates a whole `where` clause against a stored record. */
+/**
+ * Evaluates a whole `where` clause against a stored record.
+ *
+ * The groups below are split by subject rather than by field order, so a failing
+ * group points at the kind of filter that rejected the record, and each group can
+ * be exercised on its own.
+ */
 export function matchesRecord(record: StoredFile, where: Where | undefined): boolean {
   // An absent filter still means "live records only", so normalise it to `{}`
   // rather than treating it as "match everything".
   const filter: Where = where ?? {};
+  return (
+    matchesIdentity(record, filter) &&
+    matchesType(record, filter) &&
+    matchesSize(record, filter) &&
+    matchesDates(record, filter) &&
+    matchesPlacement(record, filter) &&
+    matchesFlags(record, filter) &&
+    matchesContent(record, filter)
+  );
+}
 
+/** Id and display name. */
+function matchesIdentity(record: StoredFile, filter: Where): boolean {
   if (filter.id !== undefined && !matchesScalarList(record.id, filter.id)) return false;
   if (filter.name !== undefined && !matchesString(record.name, filter.name)) return false;
+  return true;
+}
+
+/** Kind, MIME type and extension. */
+function matchesType(record: StoredFile, filter: Where): boolean {
   if (filter.kind !== undefined && !matchesScalarList(record.kind, filter.kind)) return false;
   if (filter.mime !== undefined && !matchesString(record.mime, filter.mime)) return false;
   if (filter.extension !== undefined && !matchesString(record.extension, filter.extension)) {
     return false;
   }
-  if (filter.size !== undefined && !matchesNumber(record.size, filter.size)) return false;
-  if (filter.createdAt !== undefined && !matchesTime(record.createdAt, filter.createdAt)) return false;
-  if (filter.updatedAt !== undefined && !matchesTime(record.updatedAt, filter.updatedAt)) return false;
+  return true;
+}
+
+function matchesSize(record: StoredFile, filter: Where): boolean {
+  return filter.size === undefined || matchesNumber(record.size, filter.size);
+}
+
+/** Creation, modification and last-read times. */
+function matchesDates(record: StoredFile, filter: Where): boolean {
+  if (filter.createdAt !== undefined && !matchesTime(record.createdAt, filter.createdAt)) {
+    return false;
+  }
+  if (filter.updatedAt !== undefined && !matchesTime(record.updatedAt, filter.updatedAt)) {
+    return false;
+  }
   if (filter.accessedAt !== undefined && !matchesTime(record.accessedAt, filter.accessedAt)) {
     return false;
   }
+  return true;
+}
+
+/** Folder path and tags. */
+function matchesPlacement(record: StoredFile, filter: Where): boolean {
   if (filter.folder !== undefined && !matchesFolder(record.folder, filter.folder)) return false;
   if (filter.tags !== undefined && !matchesTags(record.tags, filter.tags)) return false;
+  return true;
+}
+
+/** Favourite flag and trash state. */
+function matchesFlags(record: StoredFile, filter: Where): boolean {
   if (filter.favorite !== undefined && (record.favorite === 1) !== filter.favorite) return false;
   if ((record.deletedAt > 0) !== (filter.deleted ?? false)) return false;
+  return true;
+}
+
+/** Hash, metadata and the caller's own predicate. */
+function matchesContent(record: StoredFile, filter: Where): boolean {
   if (filter.hash !== undefined && !matchesScalarList(record.hash ?? '', filter.hash)) return false;
   if (filter.metadata && !matchesMetadata(record.metadata, filter.metadata)) return false;
   if (filter.metadataContains && !matchesMetadataContains(record.metadata, filter.metadataContains)) {

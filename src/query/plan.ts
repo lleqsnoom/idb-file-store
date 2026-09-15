@@ -29,81 +29,84 @@ const FULL_SCAN: IndexPlan = { index: null, range: null, direction: 'next', empt
 /** Highest character in the BMP, used to build prefix ranges. */
 const HIGH_CHAR = '\uffff';
 
-/** Chooses the best available index for a `where` clause. */
+/**
+ * Chooses the best available index for a `where` clause.
+ *
+ * Selection is a documented preference order, not a cost model: the first clause
+ * that can narrow the scan wins. That is enough because the predicate pass always
+ * runs afterwards, so an unhelpful plan costs time but never correctness.
+ */
 export function planIndex(where: Where | undefined): IndexPlan {
   const filter: Where = where ?? {};
+  return directPlan(filter) ?? indexPlan(filter) ?? fallbackPlan(filter);
+}
 
-  if (typeof filter.id === 'string') {
-    return { index: null, range: IDBKeyRange.only(filter.id), direction: 'next', empty: false };
-  }
+/** Clauses addressed by the primary key, a name, a type or a hash. */
+function directPlan(filter: Where): IndexPlan | null {
+  return (
+    idPlan(filter.id) ??
+    namePlan(filter.name) ??
+    stringPlan(filter.mime, INDEX.mime) ??
+    stringPlan(filter.extension, INDEX.extension) ??
+    stringPlan(filter.hash, INDEX.hash) ??
+    singleValuePlan(filter.kind, INDEX.kind) ??
+    folderPlan(filter.folder)
+  );
+}
 
-  const byName = namePlan(filter.name);
-  if (byName) return byName;
+/** Clauses addressed by a numeric index, plus the multi-entry tag index. */
+function indexPlan(filter: Where): IndexPlan | null {
+  return (
+    rangePlan(filter.createdAt, INDEX.createdAt) ??
+    rangePlan(filter.size, INDEX.size) ??
+    rangePlan(filter.updatedAt, INDEX.updatedAt) ??
+    rangePlan(filter.accessedAt, INDEX.accessedAt) ??
+    singleValuePlan(firstTag(filter.tags), INDEX.tags)
+  );
+}
 
-  const byMime = stringPlan(filter.mime, INDEX.mime);
-  if (byMime) return byMime;
-
-  const byExtension = stringPlan(filter.extension, INDEX.extension);
-  if (byExtension) return byExtension;
-
-  const byHash = stringPlan(filter.hash, INDEX.hash);
-  if (byHash) return byHash;
-
-  const kind = firstOf(filter.kind);
-  if (kind) return { index: INDEX.kind, range: IDBKeyRange.only(kind), direction: 'next', empty: false };
-
-  const byFolder = folderPlan(filter.folder);
-  if (byFolder) return byFolder;
-
-  const byCreated = rangePlan(filter.createdAt, INDEX.createdAt);
-  if (byCreated) return byCreated;
-
-  const bySize = rangePlan(filter.size, INDEX.size);
-  if (bySize) return bySize;
-
-  const byUpdated = rangePlan(filter.updatedAt, INDEX.updatedAt);
-  if (byUpdated) return byUpdated;
-
-  const byAccessed = rangePlan(filter.accessedAt, INDEX.accessedAt);
-  if (byAccessed) return byAccessed;
-
-  const tag = firstTag(filter.tags);
-  if (tag) return { index: INDEX.tags, range: IDBKeyRange.only(tag), direction: 'next', empty: false };
-
+/** Clauses that are always available, so they are the last resort. */
+function fallbackPlan(filter: Where): IndexPlan {
   if (filter.favorite !== undefined) {
-    return {
-      index: INDEX.favorite,
-      range: IDBKeyRange.only(filter.favorite ? 1 : 0),
-      direction: 'next',
-      empty: false,
-    };
+    return ranged(INDEX.favorite, IDBKeyRange.only(filter.favorite ? 1 : 0));
   }
-
   // Every query defaults to live records only, so filtering out the trash through
   // an index beats scanning the whole store.
   if ((filter.deleted ?? false) === false) {
-    return { index: INDEX.deletedAt, range: IDBKeyRange.only(0), direction: 'next', empty: false };
+    return ranged(INDEX.deletedAt, IDBKeyRange.only(0));
   }
-
   return FULL_SCAN;
+}
+
+/**
+ * Plans a scan of one index value, when the filter names exactly one.
+ *
+ * A list of alternatives cannot drive a single IndexedDB cursor, so those fall
+ * through to the next clause and are resolved by the predicate pass instead.
+ */
+function singleValuePlan(value: OneOrMany<string> | null | undefined, index: string | null): IndexPlan | null {
+  const only = firstOf(value);
+  return only ? ranged(index, IDBKeyRange.only(only)) : null;
+}
+
+/** Ids live on the primary key, which is not an index. */
+function idPlan(value: Where['id']): IndexPlan | null {
+  return singleValuePlan(value, null);
+}
+
+/** An ascending scan of `range` on `index`; `null` means the primary key. */
+function ranged(index: string | null, range: IDBKeyRange | null): IndexPlan {
+  return { index, range, direction: 'next', empty: false };
 }
 
 function namePlan(filter: Where['name']): IndexPlan | null {
   if (filter === undefined) return null;
-  if (typeof filter === 'string') {
-    return exactPlan(INDEX.name, filter.toLowerCase());
-  }
+  if (typeof filter === 'string') return exactPlan(INDEX.name, filter.toLowerCase());
   if (Array.isArray(filter)) return null;
   const operators = filter as StringOperators;
   if (operators.eq !== undefined) return exactPlan(INDEX.name, operators.eq.toLowerCase());
   if (operators.startsWith !== undefined) {
-    const prefix = operators.startsWith.toLowerCase();
-    return {
-      index: INDEX.name,
-      range: IDBKeyRange.bound(prefix, `${prefix}${HIGH_CHAR}`, false, true),
-      direction: 'next',
-      empty: false,
-    };
+    return prefixPlan(INDEX.name, operators.startsWith.toLowerCase());
   }
   if (operators.in && operators.in.length === 1) {
     return exactPlan(INDEX.name, (operators.in[0] as string).toLowerCase());
@@ -121,24 +124,42 @@ function stringPlan(
   const operators = filter as StringOperators;
   if (operators.eq !== undefined) return exactPlan(index, operators.eq.toLowerCase());
   if (operators.startsWith !== undefined) {
-    const prefix = operators.startsWith.toLowerCase();
-    return {
-      index,
-      range: IDBKeyRange.bound(prefix, `${prefix}${HIGH_CHAR}`, false, true),
-      direction: 'next',
-      empty: false,
-    };
+    return prefixPlan(index, operators.startsWith.toLowerCase());
   }
   return null;
 }
 
+/**
+ * Plans a subtree scan for `folder: { startsWith }`.
+ *
+ * Folders are normalised and stored ordered, so a prefix range narrows the scan
+ * the same way it does for names. The range can still admit siblings such as
+ * `/photos-old`, which is why `matchesFolder` stays the correctness guard.
+ */
 function folderPlan(filter: Where['folder']): IndexPlan | null {
   if (filter === undefined) return null;
   if (typeof filter === 'string') return exactPlan(INDEX.folder, normalizeFolder(filter));
   if (Array.isArray(filter)) return null;
   const operators = filter as Exclude<NonNullable<Where['folder']>, string | readonly string[]>;
   if (operators.eq !== undefined) return exactPlan(INDEX.folder, normalizeFolder(operators.eq));
+  if (operators.startsWith !== undefined) {
+    return prefixPlan(INDEX.folder, normalizeFolder(operators.startsWith));
+  }
   return null;
+}
+
+/**
+ * Range covering every key that begins with `prefix`.
+ *
+ * The upper bound appends `\uffff` and is left open, which sorts above any
+ * string starting with the prefix while excluding the sentinel itself.
+ *
+ * Callers pass the prefix already normalised for the index being scanned: an
+ * index on a lowercase column needs a lowercased prefix, and the folder index
+ * needs a normalised path, because it preserves case.
+ */
+function prefixPlan(index: string, prefix: string): IndexPlan {
+  return ranged(index, IDBKeyRange.bound(prefix, `${prefix}${HIGH_CHAR}`, false, true));
 }
 
 /**
@@ -160,59 +181,81 @@ function rangePlan(filter: unknown, index: string): IndexPlan | null {
   if (!operators) return null;
 
   const range = toKeyRange(operators);
-  if (!range) return null;
-  return { index, range, direction: 'next', empty: false };
+  return range ? ranged(index, range) : null;
 }
 
+/**
+ * Turns numeric operators into an index range.
+ *
+ * `between` and the comparison operators can be combined, so the tighter of each
+ * pair wins: the highest lower bound and the lowest upper bound, with an open
+ * bound beating an inclusive one at the same value.
+ */
 function toKeyRange(operators: NumberOperators): IDBKeyRange | null {
   if (operators.eq !== undefined) return IDBKeyRange.only(operators.eq);
 
-  let lower: number | undefined;
-  let lowerOpen = false;
-  if (operators.gt !== undefined) {
-    lower = operators.gt;
-    lowerOpen = true;
-  }
-  if (operators.gte !== undefined && (lower === undefined || operators.gte > lower)) {
-    lower = operators.gte;
-    lowerOpen = false;
-  }
+  const lower = tighterLower(operators);
+  const upper = tighterUpper(operators);
 
-  let upper: number | undefined;
-  let upperOpen = false;
-  if (operators.lt !== undefined) {
-    upper = operators.lt;
-    upperOpen = true;
-  }
-  if (operators.lte !== undefined && (upper === undefined || operators.lte < upper)) {
-    upper = operators.lte;
-    upperOpen = false;
-  }
+  if (!lower) return upper ? IDBKeyRange.upperBound(upper.value, upper.open) : null;
+  if (!upper) return IDBKeyRange.lowerBound(lower.value, lower.open);
+  return IDBKeyRange.bound(lower.value, upper.value, lower.open, upper.open);
+}
 
-  if (operators.between) {
-    const [min, max] = operators.between;
-    if (lower === undefined || min > lower) {
-      lower = min;
-      lowerOpen = false;
+/** A range endpoint and whether it excludes the value it names. */
+interface Bound {
+  value: number;
+  open: boolean;
+}
+
+function tighterLower(operators: NumberOperators): Bound | null {
+  const candidates: Bound[] = [];
+  if (operators.gt !== undefined) candidates.push({ value: operators.gt, open: true });
+  if (operators.gte !== undefined) candidates.push({ value: operators.gte, open: false });
+  if (operators.between) candidates.push({ value: operators.between[0], open: false });
+  return pickBound(candidates, true);
+}
+
+function tighterUpper(operators: NumberOperators): Bound | null {
+  const candidates: Bound[] = [];
+  if (operators.lt !== undefined) candidates.push({ value: operators.lt, open: true });
+  if (operators.lte !== undefined) candidates.push({ value: operators.lte, open: false });
+  if (operators.between) candidates.push({ value: operators.between[1], open: false });
+  return pickBound(candidates, false);
+}
+
+/**
+ * Picks the most restrictive candidate.
+ *
+ * `preferHigher` is `true` for a lower bound (the largest value is tightest) and
+ * `false` for an upper bound. A tie is won by the open bound, because excluding
+ * the endpoint is stricter than including it.
+ */
+function pickBound(candidates: Bound[], preferHigher: boolean): Bound | null {
+  let best: Bound | null = null;
+  for (const candidate of candidates) {
+    if (!best) {
+      best = candidate;
+      continue;
     }
-    if (upper === undefined || max < upper) {
-      upper = max;
-      upperOpen = false;
+    if (candidate.value === best.value) {
+      if (candidate.open) best = candidate;
+      continue;
     }
+    const tighter = preferHigher
+      ? candidate.value > best.value
+      : candidate.value < best.value;
+    if (tighter) best = candidate;
   }
-
-  if (lower === undefined && upper === undefined) return null;
-  if (lower === undefined) return IDBKeyRange.upperBound(upper as number, upperOpen);
-  if (upper === undefined) return IDBKeyRange.lowerBound(lower, lowerOpen);
-  return IDBKeyRange.bound(lower, upper, lowerOpen, upperOpen);
+  return best;
 }
 
 function exactPlan(index: string, value: string): IndexPlan {
-  return { index, range: IDBKeyRange.only(value), direction: 'next', empty: false };
+  return ranged(index, IDBKeyRange.only(value));
 }
 
-function firstOf(value: OneOrMany<string> | undefined): string | null {
-  if (value === undefined) return null;
+function firstOf(value: OneOrMany<string> | null | undefined): string | null {
+  if (value === undefined || value === null) return null;
   if (typeof value === 'string') return value;
   return value.length === 1 ? (value[0] as string) : null;
 }

@@ -1,10 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import type { FileRecord } from '../src/index.js';
-import { ValidationError } from '../src/index.js';
+import { ValidationError, planIndex } from '../src/index.js';
 import { makeBlob, openDb } from './setup.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 const EPOCH = Date.UTC(2024, 0, 1);
+
+/** Every seeded file, in the order `sort: { by: 'name' }` produces. */
+const NAMES_BY_ASCENDING_NAME = [
+  'beach-morning.png',
+  'beach-sunset.jpg',
+  'holiday.mp4',
+  'invoice.pdf',
+  'notes.md',
+];
+
+/** The two seeded images, in the order `sort: { by: 'name' }` produces. */
+const IMAGES_BY_NAME = ['beach-morning.png', 'beach-sunset.jpg'];
 
 /** Seeds a small, predictable library used by most query tests. */
 async function seed() {
@@ -51,7 +63,7 @@ describe('where filters', () => {
 
     expect(
       (await db.all({ where: { kind: 'image' }, sort: { by: 'name' } })).map((r) => r.name),
-    ).toEqual(['beach-morning.png', 'beach-sunset.jpg']);
+    ).toEqual(IMAGES_BY_NAME);
     expect((await db.all({ where: { kind: ['image', 'video'] } })).length).toBe(3);
     expect((await db.all({ where: { mime: 'application/pdf' } })).length).toBe(1);
     expect((await db.all({ where: { extension: 'png' } })).length).toBe(1);
@@ -99,6 +111,36 @@ describe('where filters', () => {
     db.close();
   });
 
+  it('reuses a caller-supplied global regex without skipping records', async () => {
+    const { db } = await seed();
+
+    // A `/g` pattern keeps `lastIndex` between calls, so a naive implementation
+    // matches every other record once the same object is reused.
+    const pattern = /beach/g;
+    const first = await db.all({ where: { name: { regex: pattern } }, sort: { by: 'name' } });
+    const second = await db.all({ where: { name: { regex: pattern } }, sort: { by: 'name' } });
+
+    expect(first.map((r) => r.name)).toEqual(IMAGES_BY_NAME);
+    expect(second.map((r) => r.name)).toEqual(IMAGES_BY_NAME);
+    db.close();
+  });
+
+  it('plans an indexed subtree scan for folders and still drops siblings', async () => {
+    const db = await openDb();
+    await db.add('a', { name: 'a.txt', folder: '/photos' });
+    await db.add('b', { name: 'b.txt', folder: '/photos/2024' });
+    await db.add('c', { name: 'c.txt', folder: '/photos-old' });
+
+    expect(planIndex({ folder: { startsWith: '/photos' } }).index).toBe('by_folder');
+
+    const page = await db.all({
+      where: { folder: { startsWith: '/photos' } },
+      sort: { by: 'name' },
+    });
+    expect(page.map((r) => r.name)).toEqual(['a.txt', 'b.txt']);
+    db.close();
+  });
+
   it('filters by favorite and metadata', async () => {
     const { db } = await seed();
 
@@ -143,13 +185,7 @@ describe('sorting', () => {
     const { db } = await seed();
 
     const ascending = await db.all({ sort: { by: 'name', order: 'asc' }, limit: Infinity });
-    expect(ascending.map((r) => r.name)).toEqual([
-      'beach-morning.png',
-      'beach-sunset.jpg',
-      'holiday.mp4',
-      'invoice.pdf',
-      'notes.md',
-    ]);
+    expect(ascending.map((r) => r.name)).toEqual(NAMES_BY_ASCENDING_NAME);
 
     const descending = await db.all({ sort: { by: 'size', order: 'desc' } });
     expect(descending[0]?.size).toBe(4000);
@@ -168,7 +204,7 @@ describe('sorting', () => {
       ],
     });
     const images = page.filter((r) => r.kind === 'image');
-    expect(images.map((r) => r.name)).toEqual(['beach-morning.png', 'beach-sunset.jpg']);
+    expect(images.map((r) => r.name)).toEqual(IMAGES_BY_NAME);
     db.close();
   });
 
@@ -221,13 +257,7 @@ describe('pagination', () => {
       cursor = page.nextCursor;
     } while (cursor);
 
-    expect(seen).toEqual([
-      'beach-morning.png',
-      'beach-sunset.jpg',
-      'holiday.mp4',
-      'invoice.pdf',
-      'notes.md',
-    ]);
+    expect(seen).toEqual(NAMES_BY_ASCENDING_NAME);
     expect(new Set(seen).size).toBe(5);
     db.close();
   });

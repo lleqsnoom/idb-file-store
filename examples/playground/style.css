@@ -435,6 +435,16 @@ dialog::backdrop {
   width: 100%;
 }
 
+.preview iframe {
+  width: 100%;
+  height: 60vh;
+  border: 0;
+}
+
+.preview p {
+  color: var(--muted);
+}
+
 .preview pre {
   width: 100%;
   max-height: 60vh;

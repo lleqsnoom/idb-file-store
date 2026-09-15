@@ -8,7 +8,6 @@ import { NotSupportedError } from '../errors.js';
  * writes atomic.
  */
 
-/** Waits for a single IndexedDB request. */
 export function waitForRequest<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     request.onsuccess = () => resolve(request.result);
@@ -63,29 +62,46 @@ export function openDatabase(options: OpenOptions): Promise<IDBDatabase> {
       reject(error);
       return;
     }
-
-    request.onupgradeneeded = (event) => {
-      const db = request.result;
-      try {
-        options.upgrade(db, event.oldVersion, request.transaction as IDBTransaction);
-      } catch (error) {
-        request.transaction?.abort();
-        reject(error);
-      }
-    };
-
-    request.onsuccess = () => {
-      const db = request.result;
-      db.onversionchange = () => {
-        db.close();
-        options.onVersionChange?.();
-      };
-      resolve(db);
-    };
-
-    request.onerror = () => reject(request.error ?? new Error('Failed to open the database'));
-    request.onblocked = (event) => options.onBlocked?.(event);
+    trackOpenRequest(request, options, resolve, reject);
   });
+}
+
+/** Routes the four lifecycle events of an open request onto the promise. */
+function trackOpenRequest(
+  request: IDBOpenDBRequest,
+  options: OpenOptions,
+  resolve: (database: IDBDatabase) => void,
+  reject: (reason: unknown) => void,
+): void {
+  request.onupgradeneeded = (event) => runUpgrade(request, options, event, reject);
+
+  request.onsuccess = () => {
+    const database = request.result;
+    database.onversionchange = () => {
+      // Another tab is upgrading, so this handle is about to be invalid.
+      database.close();
+      options.onVersionChange?.();
+    };
+    resolve(database);
+  };
+
+  request.onerror = () => reject(request.error ?? new Error('Failed to open the database'));
+  request.onblocked = (event) => options.onBlocked?.(event);
+}
+
+/** Runs the migration callback, rolling the upgrade back when it throws. */
+function runUpgrade(
+  request: IDBOpenDBRequest,
+  options: OpenOptions,
+  event: IDBVersionChangeEvent,
+  reject: (reason: unknown) => void,
+): void {
+  try {
+    options.upgrade(request.result, event.oldVersion, request.transaction as IDBTransaction);
+  } catch (error) {
+    request.transaction?.abort();
+    reject(error);
+  }
 }
 
 /** Deletes a whole database. */

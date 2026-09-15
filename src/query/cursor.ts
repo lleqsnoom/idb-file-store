@@ -23,7 +23,6 @@ export interface CursorPayload {
   id: string;
 }
 
-/** Encodes a cursor key into an opaque string. */
 export function encodeCursor(key: readonly (string | number)[], id: string): string {
   const payload: CursorPayload = { v: CURSOR_VERSION, k: [...key], id };
   return base64UrlEncode(JSON.stringify(payload));

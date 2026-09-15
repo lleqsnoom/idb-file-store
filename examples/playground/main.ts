@@ -200,28 +200,42 @@ function emptyState(): HTMLElement {
 function card(record: FileRecord): HTMLElement {
   const node = document.createElement('article');
   node.className = record.deleted ? 'card trashed' : 'card';
+  node.append(cardThumbnail(record), cardDetails(record), cardActions(record));
+  node.addEventListener('click', () => void openViewer(record));
+  return node;
+}
 
+/** Preview slot, filled in later when a preview exists. */
+function cardThumbnail(record: FileRecord): HTMLElement {
   const thumb = document.createElement('div');
   thumb.className = 'thumb';
   thumb.textContent = record.extension || record.kind;
-  node.append(thumb);
   void fillThumbnail(record, thumb);
+  return thumb;
+}
 
+/** Name plus a size, folder and tag summary. */
+function cardDetails(record: FileRecord): HTMLElement {
   const meta = document.createElement('div');
   meta.className = 'meta';
+
   const name = document.createElement('strong');
   name.textContent = record.name;
-  const details = document.createElement('small');
-  details.textContent = [
-    formatBytes(record.size),
-    record.folder,
-    record.tags.length > 0 ? record.tags.map((tag) => `#${tag}`).join(' ') : '',
-  ]
+
+  const { size, folder, tags } = record;
+  const summary = [formatBytes(size), folder, tags.map((tag) => `#${tag}`).join(' ')]
     .filter(Boolean)
     .join(' - ');
-  meta.append(name, details);
-  node.append(meta);
 
+  const details = document.createElement('small');
+  details.textContent = summary;
+
+  meta.append(name, details);
+  return meta;
+}
+
+/** Row actions. Clicks are stopped so they do not also open the viewer. */
+function cardActions(record: FileRecord): HTMLElement {
   const actions = document.createElement('div');
   actions.className = 'actions';
 
@@ -252,10 +266,7 @@ function card(record: FileRecord): HTMLElement {
   });
 
   actions.append(star, remove);
-  node.append(actions);
-
-  node.addEventListener('click', () => void openViewer(record));
-  return node;
+  return actions;
 }
 
 async function fillThumbnail(record: FileRecord, target: HTMLElement): Promise<void> {
@@ -373,57 +384,59 @@ async function openViewer(record: FileRecord): Promise<void> {
 async function renderPreview(record: FileRecord): Promise<void> {
   viewerParts.preview.replaceChildren(placeholder('Loading'));
   try {
-    if (record.kind === 'image') {
-      const img = document.createElement('img');
-      img.alt = record.name;
-      img.src = objectUrl(await db.getBlob(record.id));
-      viewerParts.preview.replaceChildren(img);
-      return;
-    }
-
-    if (record.kind === 'video') {
-      const video = document.createElement('video');
-      video.controls = true;
-      video.src = objectUrl(await db.getBlob(record.id));
-      viewerParts.preview.replaceChildren(video);
-      return;
-    }
-
-    if (record.kind === 'audio') {
-      const audio = document.createElement('audio');
-      audio.controls = true;
-      audio.src = objectUrl(await db.getBlob(record.id));
-      viewerParts.preview.replaceChildren(audio);
-      return;
-    }
-
-    if (record.mime === 'application/pdf') {
-      const frame = document.createElement('iframe');
-      frame.src = objectUrl(await db.getBlob(record.id));
-      frame.style.width = '100%';
-      frame.style.height = '60vh';
-      frame.style.border = '0';
-      viewerParts.preview.replaceChildren(frame);
-      return;
-    }
-
-    if (record.kind === 'text' || record.kind === 'code') {
-      const pre = document.createElement('pre');
-      pre.textContent = await db.getText(record.id);
-      viewerParts.preview.replaceChildren(pre);
-      return;
-    }
-
-    viewerParts.preview.replaceChildren(placeholder('No preview for this type'));
+    viewerParts.preview.replaceChildren(await previewNode(record));
   } catch (error) {
     viewerParts.preview.replaceChildren(placeholder('Preview failed'));
     fail(error);
   }
 }
 
+/** Picks the element that previews a record best. */
+async function previewNode(record: FileRecord): Promise<HTMLElement> {
+  if (record.kind === 'image') return imagePreview(record);
+  if (record.kind === 'video') return videoPreview(record);
+  if (record.kind === 'audio') return audioPreview(record);
+  if (record.mime === 'application/pdf') return pdfPreview(record);
+  if (record.kind === 'text' || record.kind === 'code') return textPreview(record);
+  return placeholder('No preview for this type');
+}
+
+async function imagePreview(record: FileRecord): Promise<HTMLElement> {
+  const image = document.createElement('img');
+  image.alt = record.name;
+  image.src = objectUrl(await db.getBlob(record.id));
+  return image;
+}
+
+async function videoPreview(record: FileRecord): Promise<HTMLElement> {
+  const video = document.createElement('video');
+  video.controls = true;
+  video.src = objectUrl(await db.getBlob(record.id));
+  return video;
+}
+
+async function audioPreview(record: FileRecord): Promise<HTMLElement> {
+  const audio = document.createElement('audio');
+  audio.controls = true;
+  audio.src = objectUrl(await db.getBlob(record.id));
+  return audio;
+}
+
+async function pdfPreview(record: FileRecord): Promise<HTMLElement> {
+  const frame = document.createElement('iframe');
+  frame.title = record.name;
+  frame.src = objectUrl(await db.getBlob(record.id));
+  return frame;
+}
+
+async function textPreview(record: FileRecord): Promise<HTMLElement> {
+  const pre = document.createElement('pre');
+  pre.textContent = await db.getText(record.id);
+  return pre;
+}
+
 function placeholder(text: string): HTMLElement {
   const node = document.createElement('p');
-  node.style.color = 'var(--muted)';
   node.textContent = text;
   return node;
 }
@@ -551,14 +564,27 @@ async function run(action: () => Promise<void>): Promise<void> {
   }
 }
 
+/** Wires the whole page. Each group below owns one region of the UI. */
 function wireEvents(): void {
+  wireUpload();
+  wireFilters();
+  wireToolbar();
+  wireViewer();
+  wireDatabaseEvents();
+}
+
+/** Drop zone, hidden file input and drag feedback. */
+function wireUpload(): void {
+  const accept = (files: FileList | null): void => {
+    if (files) void ingest(Array.from(files));
+  };
+
   dropZone.addEventListener('click', () => picker.click());
   dropZone.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' || event.key === ' ') picker.click();
   });
-
   picker.addEventListener('change', () => {
-    if (picker.files) void ingest(Array.from(picker.files));
+    accept(picker.files);
     picker.value = '';
   });
 
@@ -573,43 +599,49 @@ function wireEvents(): void {
   }
   dropZone.addEventListener('drop', (event) => {
     event.preventDefault();
-    void ingest(Array.from(event.dataTransfer?.files ?? []));
+    accept(event.dataTransfer?.files ?? null);
   });
+}
 
+/** Search and filter fields, debounced so typing does not thrash IndexedDB. */
+function wireFilters(): void {
   let debounce = 0;
   const refilter = (): void => {
     window.clearTimeout(debounce);
     debounce = window.setTimeout(() => void refresh(), 180);
   };
+  const onText = (assign: () => void): void => {
+    assign();
+    refilter();
+  };
+  const onChoice = (assign: () => void): void => {
+    assign();
+    void refresh();
+  };
 
-  controls.search.addEventListener('input', () => {
-    state.search = controls.search.value.trim();
-    refilter();
-  });
-  controls.name.addEventListener('input', () => {
-    state.name = controls.name.value.trim();
-    refilter();
-  });
-  controls.minSize.addEventListener('input', () => {
-    state.minSizeKb = controls.minSize.value.trim();
-    refilter();
-  });
-  controls.tag.addEventListener('change', () => {
-    state.tag = controls.tag.value;
-    void refresh();
-  });
-  controls.folder.addEventListener('change', () => {
-    state.folder = controls.folder.value;
-    void refresh();
-  });
-  controls.favorite.addEventListener('change', () => {
-    state.favorite = controls.favorite.checked;
-    void refresh();
-  });
-  controls.trash.addEventListener('change', () => {
-    state.trashed = controls.trash.checked;
-    void refresh();
-  });
+  controls.search.addEventListener('input', () =>
+    onText(() => (state.search = controls.search.value.trim())),
+  );
+  controls.name.addEventListener('input', () =>
+    onText(() => (state.name = controls.name.value.trim())),
+  );
+  controls.minSize.addEventListener('input', () =>
+    onText(() => (state.minSizeKb = controls.minSize.value.trim())),
+  );
+  controls.tag.addEventListener('change', () => onChoice(() => (state.tag = controls.tag.value)));
+  controls.folder.addEventListener('change', () =>
+    onChoice(() => (state.folder = controls.folder.value)),
+  );
+  controls.favorite.addEventListener('change', () =>
+    onChoice(() => (state.favorite = controls.favorite.checked)),
+  );
+  controls.trash.addEventListener('change', () =>
+    onChoice(() => (state.trashed = controls.trash.checked)),
+  );
+}
+
+/** Sort, page size, layout and the bulk-action buttons. */
+function wireToolbar(): void {
   controls.sort.addEventListener('change', () => {
     state.sortBy = controls.sort.value;
     void refresh();
@@ -625,6 +657,7 @@ function wireEvents(): void {
   });
   controls.more.addEventListener('click', () => void refresh(true));
   controls.sample.addEventListener('click', () => void addSampleFiles());
+
   controls.emptyTrash.addEventListener('click', () => {
     void run(async () => {
       const removed = await db.emptyTrash();
@@ -640,70 +673,78 @@ function wireEvents(): void {
       await refresh();
     });
   });
+}
 
+/** Runs an action against the record currently open in the viewer. */
+function withOpenRecord(action: (record: FileRecord) => Promise<void>): void {
+  const record = state.open;
+  if (record) void run(() => action(record));
+}
+
+/** The preview dialog: frame behaviour, then the actions inside it. */
+function wireViewer(): void {
+  wireViewerChrome();
+  wireViewerActions();
+}
+
+/** Closing the dialog and the bookkeeping that goes with it. */
+function wireViewerChrome(): void {
   viewerParts.close.addEventListener('click', () => viewer.close());
   viewer.addEventListener('close', () => {
     state.open = null;
     releaseUrls();
     void refresh();
   });
+  viewerParts.notes.addEventListener('change', () =>
+    withOpenRecord(async (record) => {
+      await db.update(record.id, { notes: viewerParts.notes.value });
+      toast('Note saved');
+    }),
+  );
+}
 
-  viewerParts.download.addEventListener('click', () => {
-    const record = state.open;
-    if (!record) return;
-    void run(() => db.download(record.id));
-  });
+/** Download, favourite, rename, tag and trash for the open record. */
+function wireViewerActions(): void {
+  viewerParts.download.addEventListener('click', () =>
+    withOpenRecord((record) => db.download(record.id)),
+  );
 
-  viewerParts.favorite.addEventListener('click', () => {
-    const record = state.open;
-    if (!record) return;
-    void run(async () => {
+  viewerParts.favorite.addEventListener('click', () =>
+    withOpenRecord(async (record) => {
       await db.setFavorite([record.id], !record.favorite);
       viewer.close();
-    });
-  });
+    }),
+  );
 
   viewerParts.rename.addEventListener('click', () => {
-    const record = state.open;
-    if (!record) return;
-    const next = prompt('New name', record.name);
+    const next = prompt('New name', state.open?.name ?? '');
     if (!next) return;
-    void run(async () => {
+    withOpenRecord(async (record) => {
       await db.update(record.id, { name: next });
       viewer.close();
     });
   });
 
   viewerParts.tag.addEventListener('click', () => {
-    const record = state.open;
-    if (!record) return;
     const next = prompt('Add a tag', 'favourite');
     if (!next) return;
-    void run(async () => {
+    withOpenRecord(async (record) => {
       await db.setTags(record.id, { add: [next] });
       viewer.close();
     });
   });
 
-  viewerParts.trash.addEventListener('click', () => {
-    const record = state.open;
-    if (!record) return;
-    void run(async () => {
+  viewerParts.trash.addEventListener('click', () =>
+    withOpenRecord(async (record) => {
       if (record.deleted) await db.restore([record.id]);
       else await db.trash([record.id]);
       viewer.close();
-    });
-  });
+    }),
+  );
+}
 
-  viewerParts.notes.addEventListener('change', () => {
-    const record = state.open;
-    if (!record) return;
-    void run(async () => {
-      await db.update(record.id, { notes: viewerParts.notes.value });
-      toast('Note saved');
-    });
-  });
-
+/** Reflects writes made in another tab. */
+function wireDatabaseEvents(): void {
   db.on('change', ({ remote }) => {
     if (remote) void refresh();
   });

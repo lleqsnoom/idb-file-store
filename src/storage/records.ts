@@ -6,8 +6,8 @@ import type { FileKind, JsonValue } from '../types.js';
  * It differs from the public {@link FileRecord} in three deliberate ways:
  * - booleans are stored as `0 | 1`, because IndexedDB cannot index booleans,
  * - `deletedAt` uses `0` for "live" so the field is always indexable,
- * - `nameLower` and `searchText` are denormalised to make sorting and searching
- *   cheap, since IndexedDB cannot sort case-insensitively on its own.
+ * - one lowercase column per searchable field is denormalised, because IndexedDB
+ *   cannot sort case-insensitively and the ranker needs a lowercase copy anyway.
  */
 
 /** Internal record stored in the `files` object store. */
@@ -33,8 +33,6 @@ export interface StoredFile {
   textLower: string;
   tagsLower: string;
   metaText: string;
-  searchText: string;
-  searchTokens: string[];
   width: number | null;
   height: number | null;
   durationMs: number | null;

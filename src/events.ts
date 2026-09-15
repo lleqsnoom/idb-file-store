@@ -18,7 +18,7 @@ export type Unsubscribe = () => void;
 export class Emitter<M extends EventMap> {
   readonly #listeners = new Map<keyof M, Set<Listener<never>>>();
 
-  /** Registers `listener` for `event`. Returns a function that unregisters it. */
+  /** The returned function removes the listener again. */
   on<K extends keyof M>(event: K, listener: Listener<M[K]>): Unsubscribe {
     let set = this.#listeners.get(event);
     if (!set) {
@@ -29,7 +29,6 @@ export class Emitter<M extends EventMap> {
     return () => this.off(event, listener);
   }
 
-  /** Registers `listener` for exactly one emission of `event`. */
   once<K extends keyof M>(event: K, listener: Listener<M[K]>): Unsubscribe {
     const unsubscribe = this.on(event, (payload) => {
       unsubscribe();
@@ -38,7 +37,7 @@ export class Emitter<M extends EventMap> {
     return unsubscribe;
   }
 
-  /** Removes `listener`, or every listener for `event` when omitted. */
+  /** Omitting `listener` clears every listener for the event. */
   off<K extends keyof M>(event: K, listener?: Listener<M[K]>): void {
     const set = this.#listeners.get(event);
     if (!set) return;

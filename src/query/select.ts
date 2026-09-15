@@ -37,6 +37,11 @@ export interface Selection {
   nextCursor: string | null;
   /** Sort instructions that were applied, useful for cursor round trips. */
   sorts: Sort[];
+  /**
+   * The limit that was actually applied, after clamping. Reported so callers
+   * echo a finite, `JSON.stringify`-safe number rather than `Infinity`.
+   */
+  limit: number;
 }
 
 /** Applies `query` to an already-filtered-by-index candidate set. */
@@ -71,7 +76,7 @@ export function selectRecords(candidates: readonly StoredFile[], query: Query): 
     nextCursor = encodeCursor(cursorKey(last.row, sorts), last.row.id);
   }
 
-  return { rows: page, total, nextCursor, sorts };
+  return { rows: page, total, nextCursor, sorts, limit };
 }
 
 /** Drops everything at or before the cursor position. */
