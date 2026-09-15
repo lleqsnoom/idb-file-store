@@ -1,9 +1,19 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "baseUrl": ".",
+    "paths": {
+      "idb-file-store": [
+        "./src/index.ts"
+      ]
+    },
     "moduleDetection": "force",
     "strict": true,
     "noImplicitOverride": true,
@@ -19,5 +29,10 @@
     "sourceMap": true,
     "noEmit": true
   },
-  "include": ["src", "test", "examples/playground/main.ts", "*.config.ts"]
+  "include": [
+    "src",
+    "test",
+    "examples/playground/main.ts",
+    "*.config.ts"
+  ]
 }
