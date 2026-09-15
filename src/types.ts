@@ -159,30 +159,46 @@ export interface StorageStats {
 /** Anything the library can turn into stored bytes. */
 export type FileInput = Blob | File | ArrayBuffer | ArrayBufferView | string;
 
-/** Options accepted by {@link FileDB.add} and {@link FileDB.addMany}. */
-export interface AddOptions {
-  /** Explicit id. A random UUID is generated when omitted. */
-  id?: string;
-  /** Display name. Derived from `File.name` or the MIME type when omitted. */
+/**
+ * Fields a caller may set on a record, whether it is being created or changed.
+ *
+ * {@link AddOptions} and {@link UpdateOptions} both extend this, so an option
+ * added here is available at every call site and the two cannot drift apart.
+ * `null` clears an optional field.
+ */
+export interface MutableFileFields {
+  /** Display name. Derived from `File.name`, then the MIME type, when omitted. */
   name?: string;
-  /** Explicit MIME type, overriding detection. */
+  /** MIME type, overriding detection. */
   mime?: string;
-  /** Explicit kind, overriding detection from the MIME type. */
+  /** Coarse kind, overriding detection from the MIME type. */
   kind?: FileKind;
-  /** Initial tags. */
+  /** Tag list. Replaces the existing tags on an update. */
   tags?: string[];
   /** Virtual folder. Normalised to always start with `/`. */
   folder?: string;
-  /** Star the record immediately. */
+  /** Star or unstar the record. */
   favorite?: boolean;
-  /** Searchable notes. */
+  /** Notes, indexed for search. */
   notes?: string;
-  /** Structured application data. */
+  /** Structured application data. Must survive a JSON round trip. */
   metadata?: Record<string, JsonValue>;
-  /** Override creation time. */
-  createdAt?: number | Date;
   /** Override modification time. */
   updatedAt?: number | Date;
+  /** Known pixel width (images and video), `null` to clear. */
+  width?: number | null;
+  /** Known pixel height (images and video), `null` to clear. */
+  height?: number | null;
+  /** Known duration in milliseconds (audio and video), `null` to clear. */
+  durationMs?: number | null;
+}
+
+/** Options accepted by {@link FileDB.add} and {@link FileDB.addMany}. */
+export interface AddOptions extends MutableFileFields {
+  /** Explicit id. A random UUID is generated when omitted. */
+  id?: string;
+  /** Override creation time. */
+  createdAt?: number | Date;
   /** Pre-supplied searchable text. Skips text extraction. */
   text?: string;
   /** Extract text from text-like payloads for search. Defaults to the db option. */
@@ -191,48 +207,24 @@ export interface AddOptions {
   generateThumbnail?: boolean;
   /** Chunk size in bytes. Defaults to the db option. */
   chunkSize?: number;
-  /** Compute the SHA-256 content hash. Defaults to the db option. */
+  /** Compute the content hash. Defaults to the db option. */
   computeHash?: boolean;
   /** Return an existing identical record instead of writing a copy. */
   dedupe?: boolean;
-  /** Known pixel width (images and video). */
+  /** Known pixel width, when detection is unavailable. */
   width?: number;
-  /** Known pixel height (images and video). */
+  /** Known pixel height, when detection is unavailable. */
   height?: number;
-  /** Known duration in milliseconds (audio and video). */
+  /** Known duration in milliseconds, when detection is unavailable. */
   durationMs?: number;
 }
 
-/** Options accepted by {@link FileDB.update}. `null` clears an optional field. */
-export interface UpdateOptions {
-  /** New display name. */
-  name?: string;
-  /** New MIME type. */
-  mime?: string;
-  /** New kind. */
-  kind?: FileKind;
-  /** Replace the tag list. */
-  tags?: string[];
-  /** Move the record to another folder. */
-  folder?: string;
-  /** Star or unstar. */
-  favorite?: boolean;
-  /** Replace the notes. */
-  notes?: string;
-  /** Replace the structured data. */
-  metadata?: Record<string, JsonValue>;
-  /** Replace the searchable text. */
+/** Options accepted by {@link FileDB.update}. */
+export interface UpdateOptions extends MutableFileFields {
+  /** Replace the searchable text; `null` clears it. */
   text?: string | null;
-  /** Override modification time. */
-  updatedAt?: number | Date;
   /** Replace the bytes, re-running extraction, hashing and thumbnails. */
   data?: FileInput;
-  /** Known pixel width, `null` to clear. */
-  width?: number | null;
-  /** Known pixel height, `null` to clear. */
-  height?: number | null;
-  /** Known duration in milliseconds, `null` to clear. */
-  durationMs?: number | null;
 }
 
 /** Options accepted by read helpers such as {@link FileDB.get}. */

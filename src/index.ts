@@ -28,7 +28,6 @@ export { FileDB } from './file-db.js';
 export type { FileDBOptions, Facets, Snapshot } from './file-db.js';
 
 export {
-  ConflictError,
   ClosedError,
   FileDBError,
   NotFoundError,

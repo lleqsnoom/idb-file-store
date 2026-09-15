@@ -157,7 +157,7 @@ export function extensionOf(name: string): string {
   return base.slice(dot + 1).toLowerCase();
 }
 
-/** Returns the last path segment of a name or folder path. */
+/** Last path segment, ignoring trailing slashes. */
 export function baseName(path: string): string {
   const trimmed = path.replace(/[/\\]+$/, '');
   const index = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));

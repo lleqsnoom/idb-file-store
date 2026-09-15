@@ -28,9 +28,6 @@ export class NotSupportedError extends FileDBError {}
 /** Thrown when the browser refuses a write because the storage quota is full. */
 export class QuotaError extends FileDBError {}
 
-/** Thrown when a write conflicts with an existing record under a unique constraint. */
-export class ConflictError extends FileDBError {}
-
 const QUOTA_NAMES = new Set(['QuotaExceededError', 'NS_ERROR_DOM_QUOTA_REACHED']);
 
 /** Wraps a low-level IndexedDB failure, translating quota errors into {@link QuotaError}. */

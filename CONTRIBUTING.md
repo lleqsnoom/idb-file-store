@@ -35,9 +35,12 @@ on a clean checkout, your environment is ready.
 - **No em dashes in source code.** Use commas, parentheses or semicolons.
 - **Public API changes need docs.** Update `docs/api.md` and the README table when
   you add or rename anything users touch.
-- **JSDoc on exports.** Every exported function, type and option gets a sentence
-  explaining what it is for. Explain *why* a non-obvious choice was made, not what
-  the next line does.
+- **JSDoc on exports, but only when it earns its place.** State the behaviour the
+  signature cannot: accepted inputs, thrown errors, units, defaults, or *why* a
+  non-obvious choice was made. Do not restate the name: `/** Tests a string field
+  against a string filter. */` above `matchesString` is noise, and the reader is
+  better served by nothing. If the only honest sentence repeats the identifier,
+  delete the comment.
 
 ## Tests
 

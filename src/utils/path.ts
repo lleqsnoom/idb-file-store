@@ -57,34 +57,43 @@ export function toJsonValue(value: unknown, path: string): JsonValue {
   if (value === undefined) {
     throw new ValidationError(`metadata["${path}"] is undefined; use null instead`);
   }
-  if (typeof value === 'function' || typeof value === 'symbol') {
-    throw new ValidationError(`metadata["${path}"] must be JSON-serialisable`);
-  }
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) {
-      throw new ValidationError(`metadata["${path}"] must be a finite number`);
-    }
-    return value;
+  if (typeof value === 'number') return toJsonNumber(value, path);
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return toJsonArray(value, path);
+  if (typeof value === 'object') return toJsonObject(value as Record<string, unknown>, path);
+  throw new ValidationError(`metadata["${path}"] must be JSON-serialisable`);
+}
+
+function toJsonNumber(value: number, path: string): number {
+  if (!Number.isFinite(value)) {
+    throw new ValidationError(`metadata["${path}"] must be a finite number`);
   }
-  if (Array.isArray(value)) {
-    return value.map((item, index) => toJsonValue(item, `${path}.${index}`));
+  return value;
+}
+
+function toJsonArray(value: unknown[], path: string): JsonValue[] {
+  return value.map((item, index) => toJsonValue(item, `${path}.${index}`));
+}
+
+/**
+ * Converts a plain object, dropping `undefined` entries.
+ *
+ * Binary payloads are refused outright: they survive a structured clone but not a
+ * JSON round trip, and they belong in the file store rather than in metadata.
+ */
+function toJsonObject(value: Record<string, unknown>, path: string): Record<string, JsonValue> {
+  if (value instanceof Blob || value instanceof ArrayBuffer) {
+    throw new ValidationError(
+      `metadata["${path}"] cannot hold binary data; store it as a file instead`,
+    );
   }
-  if (typeof value === 'object') {
-    if (value instanceof Date) return value.toISOString();
-    if (value instanceof Blob || value instanceof ArrayBuffer) {
-      throw new ValidationError(
-        `metadata["${path}"] cannot hold binary data; store it as a file instead`,
-      );
-    }
-    const out: Record<string, JsonValue> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (item === undefined) continue;
-      out[key] = toJsonValue(item, `${path}.${key}`);
-    }
-    return out;
+  const out: Record<string, JsonValue> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (item === undefined) continue;
+    out[key] = toJsonValue(item, `${path}.${key}`);
   }
-  return null;
+  return out;
 }
 
 /** Sanitises a whole metadata object, dropping `undefined` entries. */

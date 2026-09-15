@@ -9,3 +9,5 @@ npm-debug.log*
 .vscode/*
 !.vscode/extensions.json
 *.tsbuildinfo
+# Agent review artefacts
+.x-skills/

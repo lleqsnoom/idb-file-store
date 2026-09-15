@@ -3,7 +3,7 @@ import type { FileRecord, FileKind, JsonValue, ReadOptions } from '../types.js';
 import type { StoredFile } from '../storage/records.js';
 import { metadataToSearchText, normalizeFolder, normalizeMetadata } from './path.js';
 import { kindFromMime } from './mime.js';
-import { normalizeText, tokenize } from './text.js';
+import { normalizeText } from './text.js';
 
 /**
  * Translation between the on-disk {@link StoredFile} and the public
@@ -28,8 +28,6 @@ export interface SearchColumns {
   textLower: string;
   tagsLower: string;
   metaText: string;
-  searchText: string;
-  searchTokens: string[];
 }
 
 /**
@@ -37,8 +35,8 @@ export interface SearchColumns {
  *
  * Each searchable field gets its own lowercase column so that `search.fields`
  * can restrict matching to a subset without re-reading the original values.
- * `searchText`/`searchTokens` are the union, used by the default "search
- * everywhere" path.
+ * The ranker reads those columns directly, and the default "search everywhere"
+ * path is simply the full set of them, so no merged copy is needed.
  */
 export function buildSearchColumns(source: SearchableSource): SearchColumns {
   const nameLower = normalizeText(source.name);
@@ -46,20 +44,8 @@ export function buildSearchColumns(source: SearchableSource): SearchColumns {
   const textLower = normalizeText(source.text);
   const tagsLower = normalizeText(source.tags.join(' '));
   const metaText = normalizeText(metadataToSearchText(source.metadata));
-  const searchText = [nameLower, tagsLower, normalizeText(source.folder), source.mime, notesLower, textLower, metaText]
-    .filter(Boolean)
-    .join(' ')
-    .slice(0, 400_000);
 
-  return {
-    nameLower,
-    notesLower,
-    textLower,
-    tagsLower,
-    metaText,
-    searchText,
-    searchTokens: tokenize(searchText),
-  };
+  return { nameLower, notesLower, textLower, tagsLower, metaText };
 }
 
 /** Normalises a tag list: trims, lowercases for matching but keeps display case. */
@@ -95,7 +81,6 @@ export function normalizeName(name: string): string {
   return trimmed;
 }
 
-/** Converts a stored row into the public record shape. */
 export function toPublicRecord(
   stored: StoredFile,
   options: {

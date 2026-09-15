@@ -20,7 +20,6 @@ import {
 import {
   deleteChunks,
   deleteChunksForMany,
-  normalizeChunkSize,
   readChunkRange,
   readChunks,
   writeChunks,
@@ -34,9 +33,10 @@ import {
   type Wait,
 } from './storage/idb.js';
 import type { StoredFile, StoredThumbnail } from './storage/records.js';
-import { planIndex } from './query/plan.js';
+import { prepareWrite, type PreparedWrite } from './storage/prepare.js';
+import { planIndex, type IndexPlan } from './query/plan.js';
 import { matchesRecord } from './query/match.js';
-import { DEFAULT_LIMIT, countRecords, selectRecords, type Selection } from './query/select.js';
+import { countRecords, selectRecords, type Selection } from './query/select.js';
 import { resolveSearch, scoreRecord } from './query/search.js';
 import { INDEX } from './storage/schema.js';
 import type {
@@ -46,11 +46,9 @@ import type {
   FileDBChange,
   FileDBEventMap,
   FileInput,
-  FileKind,
   FileRecord,
   ImportOptions,
   IterateOptions,
-  JsonValue,
   Page,
   Query,
   ReadOptions,
@@ -65,19 +63,13 @@ import {
   normalizeTags,
   prepareFolder,
   prepareMetadata,
-  resolveKind,
   resolveReadOptions,
   toPublicRecord,
 } from './utils/record.js';
-import { extensionOf, mimeFromName, readTextPreview, withExtension } from './utils/mime.js';
-import { contentHash } from './utils/hash.js';
-import { createId, inputName, now, toBlob, toTimestamp } from './utils/misc.js';
+import { extensionOf, normalizeMime } from './utils/mime.js';
+import { createId, inputName, now, toTimestamp } from './utils/misc.js';
 import { normalizeMetadata } from './utils/path.js';
-import {
-  DEFAULT_THUMBNAIL_SIZE,
-  generateThumbnail,
-  readImageDimensions,
-} from './utils/thumbnail.js';
+import { DEFAULT_THUMBNAIL_SIZE } from './utils/thumbnail.js';
 
 /** Construction options for {@link FileDB}. */
 export interface FileDBOptions {
@@ -207,17 +199,14 @@ export class FileDB {
   /* Lifecycle                                                              */
   /* ---------------------------------------------------------------------- */
 
-  /** Database name. */
   get name(): string {
     return this.#options.name;
   }
 
-  /** Schema version this instance expects. */
   get version(): number {
     return this.#options.version;
   }
 
-  /** `true` while the connection is open. */
   get isOpen(): boolean {
     return this.#db !== null;
   }
@@ -268,12 +257,11 @@ export class FileDB {
     this.#emitter.emit('destroy', { name: this.#options.name });
   }
 
-  /** Subscribes to an event. Returns an unsubscribe function. */
+  /** The returned function unsubscribes the listener. */
   on<K extends keyof FileDBEventMap>(event: K, listener: Listener<FileDBEventMap[K]>): Unsubscribe {
     return this.#emitter.on(event, listener);
   }
 
-  /** Subscribes to a single emission of an event. */
   once<K extends keyof FileDBEventMap>(
     event: K,
     listener: Listener<FileDBEventMap[K]>,
@@ -310,7 +298,7 @@ export class FileDB {
   /** Stores a new file and returns its record. */
   async add(input: FileInput, options: AddOptions = {}): Promise<FileRecord> {
     const id = options.id ?? createId();
-    const prepared = await this.#prepare(input, options, id);
+    const prepared = await prepareWrite(input, options, id, this.#options);
 
     if (prepared.row.hash && (options.dedupe ?? this.#options.dedupe)) {
       const existing = await this.#findByHash(prepared.row.hash);
@@ -393,7 +381,7 @@ export class FileDB {
 
   /** `true` when a live record with this id exists. */
   async has(id: string): Promise<boolean> {
-    this.#requireDb();
+    this.#assertOpen();
     return this.transaction(STORE_FILES, 'readonly', async (tx, wait) => {
       const row = await wait(tx.objectStore(STORE_FILES).get(id) as IDBRequest<StoredFile | undefined>);
       return row !== undefined && row.deletedAt === 0;
@@ -402,7 +390,7 @@ export class FileDB {
 
   /** Reads the raw bytes of a file. */
   async getBlob(id: string): Promise<Blob> {
-    this.#requireDb();
+    this.#assertOpen();
     return this.transaction([STORE_FILES, STORE_CHUNKS], 'readonly', async (tx, wait) => {
       const row = await this.#requireRow(tx, wait, id);
       return readChunks(tx, id, row.mime, row.chunkCount);
@@ -411,7 +399,7 @@ export class FileDB {
 
   /** Reads a byte range, touching only the chunks that overlap it. */
   async readRange(id: string, start: number, end: number): Promise<Blob> {
-    this.#requireDb();
+    this.#assertOpen();
     return this.transaction([STORE_FILES, STORE_CHUNKS], 'readonly', async (tx, wait) => {
       const row = await this.#requireRow(tx, wait, id);
       return readChunkRange(tx, wait, id, start, end, row.mime, row.chunkSize);
@@ -420,7 +408,7 @@ export class FileDB {
 
   /** Reads the extracted text of a file, or an empty string when there is none. */
   async getText(id: string): Promise<string> {
-    this.#requireDb();
+    this.#assertOpen();
     return this.transaction(STORE_FILES, 'readonly', async (tx, wait) => {
       const row = await this.#requireRow(tx, wait, id);
       return row.text;
@@ -429,7 +417,7 @@ export class FileDB {
 
   /** Reads the generated preview image, when one exists. */
   async getThumbnail(id: string): Promise<Blob | null> {
-    this.#requireDb();
+    this.#assertOpen();
     return this.transaction([STORE_FILES, STORE_THUMBS], 'readonly', async (tx, wait) => {
       await this.#requireRow(tx, wait, id);
       const row = await wait(
@@ -493,10 +481,11 @@ export class FileDB {
       const current = await this.get(id);
       const declaredMime =
         options.mime || (options.data instanceof Blob ? options.data.type : '');
-      replacement = await this.#prepare(
+      replacement = await prepareWrite(
         options.data,
         { ...options, name: options.name ?? current.name, mime: declaredMime || current.mime },
         id,
+        this.#options,
       );
     }
     const thumbnail = replacement?.thumbnail ?? null;
@@ -623,7 +612,7 @@ export class FileDB {
   /** Permanently removes records, their bytes and their previews. */
   async purge(ids: readonly string[]): Promise<number> {
     if (ids.length === 0) return 0;
-    this.#requireDb();
+    this.#assertOpen();
     const removed = await this.transaction(
       [STORE_FILES, STORE_CHUNKS, STORE_THUMBS],
       'readwrite',
@@ -714,7 +703,7 @@ export class FileDB {
       items,
       total: selection.total,
       offset: query.offset ?? 0,
-      limit: query.limit ?? DEFAULT_LIMIT,
+      limit: selection.limit,
       hasMore: selection.nextCursor !== null,
       nextCursor: selection.nextCursor,
     };
@@ -827,7 +816,7 @@ export class FileDB {
 
   /** Totals per kind, per MIME type, trash size and browser quota. */
   async stats(): Promise<StorageStats> {
-    this.#requireDb();
+    this.#assertOpen();
     const rows = await this.transaction(STORE_FILES, 'readonly', async (tx) =>
       collectAll<StoredFile>(tx.objectStore(STORE_FILES), null),
     );
@@ -960,6 +949,11 @@ export class FileDB {
   /* Internals                                                              */
   /* ---------------------------------------------------------------------- */
 
+  /** Throws `ClosedError` when the connection is not open. */
+  #assertOpen(): void {
+    this.#requireDb();
+  }
+
   #requireDb(): IDBDatabase {
     if (!this.#db) {
       throw new ClosedError(
@@ -1012,83 +1006,6 @@ export class FileDB {
     }
   }
 
-  async #prepare(input: FileInput, options: PrepareOptions, id: string): Promise<PreparedWrite> {
-    const blob = toBlob(input, options.mime);
-    const explicitName = options.name ?? inputName(input);
-    if (explicitName !== undefined && explicitName.trim() === '') {
-      throw new ValidationError('File name cannot be empty');
-    }
-    const rawName = (explicitName ?? 'untitled').trim();
-    const mime = resolveMimeFor(options.mime, input, rawName);
-    const name = normalizeName(withExtension(rawName, mime));
-    const chunkSize = normalizeChunkSize(options.chunkSize ?? this.#options.chunkSize);
-    const kind = resolveKind(options.kind, mime);
-
-    const wantHash = options.computeHash ?? this.#options.computeHash;
-    const hash = wantHash && blob.size <= this.#options.hashMaxBytes ? await contentHash(blob) : null;
-
-    const wantText = options.extractText ?? this.#options.extractText;
-    const text = options.text ?? (wantText ? await readTextPreview(blob, mime, this.#options.maxTextBytes) : '');
-
-    const wantThumb = options.generateThumbnail ?? this.#options.generateThumbnails;
-    let dimensions: { width: number; height: number } | null = null;
-    let thumbnail: StoredThumbnail | null = null;
-    if (kind === 'image') {
-      dimensions = await readImageDimensions(blob);
-      if (wantThumb) {
-        const generated = await generateThumbnail(blob, { maxSize: this.#options.thumbnailMaxSize });
-        if (generated) {
-          thumbnail = {
-            id,
-            blob: generated.blob,
-            width: generated.width,
-            height: generated.height,
-            createdAt: now(),
-          };
-        }
-      }
-    }
-
-    const createdAt = toTimestamp(options.createdAt) ?? now();
-    const tags = normalizeTags(options.tags);
-    const folder = prepareFolder(options.folder);
-    const metadata = prepareMetadata(options.metadata);
-    const search = buildSearchColumns({ name, tags, folder, mime, notes: options.notes ?? '', text, metadata });
-
-    const row: Omit<StoredFile, 'id' | 'chunkCount' | 'chunkSize'> = {
-      name,
-      nameLower: search.nameLower,
-      kind,
-      mime,
-      extension: extensionOf(name),
-      size: blob.size,
-      createdAt,
-      updatedAt: toTimestamp(options.updatedAt) ?? createdAt,
-      accessedAt: createdAt,
-      hash,
-      tags,
-      folder,
-      favorite: options.favorite ? 1 : 0,
-      deletedAt: 0,
-      notes: options.notes ?? '',
-      text,
-      notesLower: search.notesLower,
-      textLower: search.textLower,
-      tagsLower: search.tagsLower,
-      metaText: search.metaText,
-      searchText: search.searchText,
-      searchTokens: search.searchTokens,
-      width: options.width ?? dimensions?.width ?? null,
-      height: options.height ?? dimensions?.height ?? null,
-      durationMs: options.durationMs ?? null,
-      metadata,
-      revision: 1,
-    };
-
-    if (thumbnail) thumbnail.id = id;
-
-    return { blob, chunkSize, thumbnail, row };
-  }
   /** Reads every row, trashed ones included. */
   async #allRows(): Promise<StoredFile[]> {
     return this.transaction(STORE_FILES, 'readonly', async (tx) =>
@@ -1106,7 +1023,7 @@ export class FileDB {
   }
 
   async #getOrNull(id: string, options: ReadOptions): Promise<FileRecord | null> {
-    this.#requireDb();
+    this.#assertOpen();
     const readOptions = resolveReadOptions(options);
     const stores = [STORE_FILES];
     if (readOptions.includeBlob) stores.push(STORE_CHUNKS);
@@ -1145,38 +1062,53 @@ export class FileDB {
   }
 
   async #updateOrNull(id: string, options: UpdateOptions): Promise<FileRecord | null> {
+    return this.#swallowMissing(() => this.update(id, options));
+  }
+
+  /**
+   * Turns a missing record into `null` instead of an error.
+   *
+   * Bulk operations report what they changed rather than failing on the first
+   * stale id, which is why the surrounding methods return arrays.
+   */
+  async #swallowMissing<T>(work: () => Promise<T>): Promise<T | null> {
     try {
-      return await this.update(id, options);
+      return await work();
     } catch (error) {
       if (error instanceof NotFoundError) return null;
       throw error;
     }
   }
 
-  /** Loads a record, lets `mutate` change it, then persists and emits an update. */
+  /** Loads a record, lets `mutate` change it, then persists it. */
   async #patch(id: string, mutate: (row: StoredFile) => boolean): Promise<FileRecord | null> {
-    this.#requireDb();
-    try {
-      const updated = await this.transaction(STORE_FILES, 'readwrite', async (tx, wait) => {
+    this.#assertOpen();
+    const updated = await this.#swallowMissing(() =>
+      this.transaction(STORE_FILES, 'readwrite', async (tx, wait) => {
         const row = await this.#requireRow(tx, wait, id);
         mutate(row);
         row.revision += 1;
         row.updatedAt = now();
         await wait(tx.objectStore(STORE_FILES).put(row));
         return row;
-      });
-      return toPublicRecord(updated);
-    } catch (error) {
-      if (error instanceof NotFoundError) return null;
-      throw error;
-    }
+      }),
+    );
+    return updated ? toPublicRecord(updated) : null;
+  }
+
+  /**
+   * Picks a scan for `where`, or `null` when the filter cannot match anything.
+   */
+  #plan(where: Where | undefined): IndexPlan | null {
+    this.#assertOpen();
+    const plan = planIndex(where);
+    return plan.empty ? null : plan;
   }
 
   /** Reads candidate rows using the best index the query allows. */
   async #candidates(where: Where | undefined): Promise<StoredFile[]> {
-    this.#requireDb();
-    const plan = planIndex(where);
-    if (plan.empty) return [];
+    const plan = this.#plan(where);
+    if (!plan) return [];
 
     return this.transaction(STORE_FILES, 'readonly', async (tx) => {
       const store = tx.objectStore(STORE_FILES);
@@ -1187,9 +1119,8 @@ export class FileDB {
 
   /** Reads only the primary keys that the plan can reach. */
   async #collectKeys(where: Where | undefined): Promise<IDBValidKey[]> {
-    this.#requireDb();
-    const plan = planIndex(where);
-    if (plan.empty) return [];
+    const plan = this.#plan(where);
+    if (!plan) return [];
 
     return this.transaction(STORE_FILES, 'readonly', async (tx) => {
       const store = tx.objectStore(STORE_FILES);
@@ -1201,7 +1132,7 @@ export class FileDB {
   /** Fetches rows by primary key in a single transaction. */
   async #getManyRows(keys: readonly IDBValidKey[]): Promise<StoredFile[]> {
     if (keys.length === 0) return [];
-    this.#requireDb();
+    this.#assertOpen();
     return this.transaction(STORE_FILES, 'readonly', async (tx, wait) => {
       const store = tx.objectStore(STORE_FILES);
       const rows = await Promise.all(
@@ -1220,7 +1151,7 @@ export class FileDB {
       return selection.rows.map(({ row, score }) => withScore(toPublicRecord(row), score));
     }
 
-    this.#requireDb();
+    this.#assertOpen();
     const stores = [STORE_FILES];
     if (wantBlob) stores.push(STORE_CHUNKS);
     if (wantThumb) stores.push(STORE_THUMBS);
@@ -1247,40 +1178,6 @@ export class FileDB {
 /* -------------------------------------------------------------------------- */
 /* Module-level helpers                                                       */
 /* -------------------------------------------------------------------------- */
-
-interface PreparedWrite {
-  blob: Blob;
-  chunkSize: number;
-  thumbnail: StoredThumbnail | null;
-  row: Omit<StoredFile, 'id' | 'chunkCount' | 'chunkSize'>;
-}
-
-/**
- * Fields {@link FileDB} reads while preparing a write.
- *
- * Both `AddOptions` and `UpdateOptions` satisfy this shape, which lets one
- * preparation path serve `add()`, `addMany()` and `update({ data })`.
- */
-interface PrepareOptions {
-  name?: string;
-  mime?: string;
-  kind?: FileKind;
-  tags?: string[];
-  folder?: string;
-  favorite?: boolean;
-  notes?: string;
-  metadata?: Record<string, JsonValue>;
-  createdAt?: number | Date;
-  updatedAt?: number | Date;
-  text?: string | null;
-  extractText?: boolean;
-  generateThumbnail?: boolean;
-  chunkSize?: number;
-  computeHash?: boolean;
-  width?: number | null;
-  height?: number | null;
-  durationMs?: number | null;
-}
 
 interface BroadcastPayload {
   source: string;
@@ -1310,20 +1207,6 @@ function dirnameOf(path: string): string {
   return index === -1 ? '' : path.slice(0, index);
 }
 
-/**
- * Decides a payload's MIME type.
- *
- * Precedence is explicit option, then the type the browser attached to a real
- * `File`/`Blob`, then the file extension. Synthesised blobs (from strings and
- * buffers) carry no meaningful type, which is why the input itself is inspected
- * rather than the blob that wraps it.
- */
-function resolveMimeFor(explicit: string | undefined, input: unknown, name: string): string {
-  const declared = explicit || (input instanceof Blob ? input.type : '');
-  if (declared) return declared.split(';')[0]?.trim().toLowerCase() ?? '';
-  return mimeFromName(name);
-}
-
 /** Recomputes the denormalised search columns after a record changed. */
 function refreshSearchColumns(row: StoredFile): void {
   const columns = buildSearchColumns({
@@ -1340,25 +1223,48 @@ function refreshSearchColumns(row: StoredFile): void {
   row.textLower = columns.textLower;
   row.tagsLower = columns.tagsLower;
   row.metaText = columns.metaText;
-  row.searchText = columns.searchText;
-  row.searchTokens = columns.searchTokens;
 }
 
-/** Applies the mutable fields of {@link UpdateOptions} onto a stored row. */
+/**
+ * Applies the mutable fields of {@link UpdateOptions} onto a stored row.
+ *
+ * Grouped by subject, so a change to one concern stays in one place: what the
+ * record is, where it sits, what it says, and how it is measured.
+ */
 function applyUpdateOptions(row: StoredFile, options: UpdateOptions): void {
+  applyIdentityOptions(row, options);
+  applyPlacementOptions(row, options);
+  applyContentOptions(row, options);
+  applyMeasurementOptions(row, options);
+}
+
+/** Name, MIME type and kind. Renaming also re-derives the extension. */
+function applyIdentityOptions(row: StoredFile, options: UpdateOptions): void {
   if (options.name !== undefined) row.name = normalizeName(options.name);
-  if (options.mime !== undefined) row.mime = options.mime.split(';')[0]?.trim().toLowerCase() ?? row.mime;
+  if (options.mime !== undefined) row.mime = normalizeMime(options.mime);
   if (options.kind !== undefined) row.kind = options.kind;
+  if (options.name !== undefined) row.extension = extensionOf(row.name);
+}
+
+/** Tags, folder and the favourite flag. */
+function applyPlacementOptions(row: StoredFile, options: UpdateOptions): void {
   if (options.tags !== undefined) row.tags = normalizeTags(options.tags);
   if (options.folder !== undefined) row.folder = prepareFolder(options.folder);
   if (options.favorite !== undefined) row.favorite = options.favorite ? 1 : 0;
+}
+
+/** Notes, structured metadata and the searchable text. */
+function applyContentOptions(row: StoredFile, options: UpdateOptions): void {
   if (options.notes !== undefined) row.notes = options.notes;
   if (options.metadata !== undefined) row.metadata = prepareMetadata(options.metadata);
   if (options.text !== undefined) row.text = options.text ?? '';
+}
+
+/** Dimensions and duration, which callers supply or clear explicitly. */
+function applyMeasurementOptions(row: StoredFile, options: UpdateOptions): void {
   if (options.width !== undefined) row.width = options.width;
   if (options.height !== undefined) row.height = options.height;
   if (options.durationMs !== undefined) row.durationMs = options.durationMs;
-  if (options.name !== undefined) row.extension = extensionOf(row.name);
 }
 
 function bump(target: Record<string, number>, key: string): void {

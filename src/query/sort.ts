@@ -35,34 +35,30 @@ export function normalizeSorts(sort: Sort | readonly Sort[] | undefined): Sort[]
   return list.map((entry) => ({ by: entry.by, order: entry.order ?? 'asc' }));
 }
 
+/**
+ * One accessor per sortable field.
+ *
+ * A `Record<SortField, ...>` rather than a `switch`: the compiler then rejects a
+ * new {@link SortField} that has no accessor, and there is no unreachable default
+ * branch to keep in step.
+ */
+const SORT_ACCESSORS: Record<SortField, (record: StoredFile) => string | number> = {
+  name: (record) => record.nameLower,
+  kind: (record) => record.kind,
+  mime: (record) => record.mime,
+  extension: (record) => record.extension,
+  folder: (record) => record.folder,
+  favorite: (record) => record.favorite,
+  size: (record) => record.size,
+  createdAt: (record) => record.createdAt,
+  updatedAt: (record) => record.updatedAt,
+  accessedAt: (record) => record.accessedAt,
+  revision: (record) => record.revision,
+};
+
 /** Extracts the value used for ordering and for cursor keys. */
 export function sortValue(record: StoredFile, field: SortField): string | number {
-  switch (field) {
-    case 'name':
-      return record.nameLower;
-    case 'kind':
-      return record.kind;
-    case 'mime':
-      return record.mime;
-    case 'extension':
-      return record.extension;
-    case 'folder':
-      return record.folder;
-    case 'favorite':
-      return record.favorite;
-    case 'size':
-      return record.size;
-    case 'createdAt':
-      return record.createdAt;
-    case 'updatedAt':
-      return record.updatedAt;
-    case 'accessedAt':
-      return record.accessedAt;
-    case 'revision':
-      return record.revision;
-    default:
-      return record.id;
-  }
+  return SORT_ACCESSORS[field](record);
 }
 
 /** Compares two records according to `sorts`, falling back to `id` for stability. */

@@ -6,7 +6,7 @@ IndexedDB. No server, no upload, no account.
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)](https://www.typescriptlang.org/)
-[![Tests](https://img.shields.io/badge/tests-109%20passing-brightgreen.svg)](test)
+[![Tests](https://img.shields.io/badge/tests-111%20passing-brightgreen.svg)](test)
 [![Dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen.svg)](package.json)
 
 ```ts
@@ -38,9 +38,9 @@ in sync across tabs. `idb-file-store` is that layer.
 
 - **Library, not a framework.** Zero runtime dependencies, no DOM assumptions,
   works in workers, ships ESM and CJS with strict TypeScript types.
-- **Bytes are handled properly.** Files are sliced into chunks on write, so a
-  two-hour video never becomes one giant allocation, and seeking only reads the
-  chunks that overlap.
+- **Bytes are handled properly.** The library slices every payload into chunks on
+  write, so a two-hour video never becomes one giant allocation, and seeking reads
+  only the chunks that overlap.
 - **Querying IndexedDB cannot do alone.** Relevance-ranked full-text search,
   natural ordering (`file2` before `file10`), computed pagination cursors.
 - **Batteries included.** Content hashing and de-duplication, auto text
@@ -49,15 +49,13 @@ in sync across tabs. `idb-file-store` is that layer.
 
 ## Install
 
-```bash
-npm install idb-file-store
-```
-
-Not published to npm yet? Install straight from GitHub:
+The package is not on npm yet, so install it from GitHub:
 
 ```bash
 npm install github:lleqsnoom/idb-file-store
 ```
+
+Once it is published, `npm install idb-file-store` will work instead.
 
 ## Quick start
 
@@ -138,9 +136,9 @@ metadata and revision. Bytes are **not** part of the record; ask for them with
 `{ startsWith: '/photos' }` for the whole subtree. Folders are strings, not
 entities, so you can build a tree with `facets().byFolder`.
 
-**Chunks.** On write, the payload is sliced into fixed-size chunks (2 MiB by
-default, configurable per call). Deleting a file is a range delete, and
-`readRange()` only loads the chunks that overlap the requested window.
+**Chunks.** The library slices every payload into fixed-size chunks on write (2 MiB
+by default, configurable per call). Deleting a file is a range delete, and
+`readRange()` loads only the chunks that overlap the requested window.
 
 **Search columns.** Each record keeps denormalised lowercase columns for name,
 tags, folder, MIME, notes, extracted text and metadata. Search is a handful of
@@ -283,13 +281,15 @@ npm run example        # http://localhost:5173
 
 ## Design notes
 
-- **Indexes do the narrowing.** The planner picks the most selective `where`
-  clause and turns it into an `IDBKeyRange`; the remaining clauses run as
-  predicates. The choice affects speed only, never results.
+- **Indexes do the narrowing.** The planner walks the `where` clauses in a fixed
+  preference order and uses the first one an index can answer, turning it into an
+  `IDBKeyRange`. The remaining clauses still run as predicates, so the choice
+  affects speed only, never results. `planIndex()` shows you the decision.
 - **Ordering and ranking happen in memory.** IndexedDB cannot sort
-  case-insensitively or rank by relevance, so candidate rows (metadata only,
-  no bytes) are loaded, scored and sorted. Keep `where` selective for very
-  large libraries, or stream with `iterate()`.
+  case-insensitively or rank by relevance, so the library loads the candidate rows
+  (metadata only, never bytes), then scores and sorts them. The cost grows with the
+  size of the candidate set, not the size of the database, so a narrow `where` keeps
+  a query cheap however much is stored. `iterate()` avoids collecting at all.
 - **One write, one transaction.** A record, its chunks and its thumbnail commit
   together, so a crash cannot leave half a file behind. `pruneOrphans()` cleans
   up anything that predates a bug or an aborted upgrade.
@@ -297,11 +297,52 @@ npm run example        # http://localhost:5173
   IndexedDB requests issued through the provided `wait` helper; awaiting a timer
   or a network call lets the browser commit early.
 
+## Performance and limits
+
+Two design choices decide how this library behaves under load. Both are
+deliberate, and both have a cost.
+
+**Writes are chunked.** The library slices every payload into fixed-size chunks
+(2 MiB by default), so a large video never becomes one allocation and a seek reads
+only the chunks it overlaps. The cost lands on reads: assembling a whole file
+concatenates its chunks, and deleting one walks a range in the chunk index.
+
+**Queries scan candidates in memory.** IndexedDB can order by only one index and
+cannot compare case-insensitively, so ordering and relevance ranking run over the
+candidate rows in JavaScript. Cost therefore scales with the number of candidate
+rows, not with how much you have stored. Narrow the candidate set with `where` and
+the same query stays cheap on a large library.
+
+Two operations are explicitly eager:
+
+- `backup()` reads every record **and its bytes** into memory at once. Use it for a
+  user-driven "download a backup" flow, not on a schedule.
+- `snapshot()` reads every record's metadata, which is small, and no bytes.
+
+There is no benchmark in this repository, so no throughput or latency numbers are
+quoted. If you need figures for your own workload, `planIndex()` shows which index
+a query will use, and `facets()` and `stats()` show how many records a filter
+matches before you page through them.
+
+## How it compares
+
+| Library | What it is for | How this differs |
+| --- | --- | --- |
+| [Dexie](https://dexie.org/) | A general IndexedDB wrapper with a query DSL and live queries. | Dexie models tables and rows. This models *files*: kind detection, chunked bytes, previews, a trash, and file-shaped queries such as "images over 1 MB, newest first". They compose well: you could store metadata in Dexie and bytes here. |
+| [localForage](https://localforage.github.io/localForage/) | A `localStorage`-style key/value API over IndexedDB, WebSQL and localStorage. | localForage gives you `getItem`/`setItem`. It has no filtering, sorting, search or paging, so every list view means loading the whole store. |
+| [SQLite-WASM](https://sqlite.org/wasm) / OPFS | A full SQL engine compiled to WebAssembly, with a synchronous file API on some origins. | Real SQL and real transactions, at the cost of a WASM payload and OPFS or worker plumbing. This library ships as plain JavaScript, needs no WASM, and works on any origin that has IndexedDB. |
+
+If you need joins, aggregates over millions of rows, or a shared schema with a
+server database, SQLite-WASM is the better tool. If you need a local file library
+with search, filters and previews inside a page bundle, this is.
+
 ## Browser support
 
-Any environment with IndexedDB and `structuredClone`: Chrome/Edge 80+,
-Firefox 74+, Safari 14+, and the matching workers. Degrades gracefully rather
-than throwing when optional APIs are missing:
+These floors come from the newest requirement of the core API, `structuredClone`:
+**Chrome/Edge 98+, Firefox 94+, Safari 15.4+**, and the matching workers. Older
+browsers may still handle basic storage, but the library does not test them.
+
+Optional APIs degrade instead of throwing when they are missing:
 
 | Feature | Without it |
 | --- | --- |
@@ -320,7 +361,7 @@ Storage is subject to browser eviction policies. Call
 ```bash
 npm install
 npm run typecheck      # tsc --noEmit
-npm test               # vitest, 109 tests on an in-memory IndexedDB
+npm test               # vitest, 111 tests on an in-memory IndexedDB
 npm run build          # tsup -> dist (ESM, CJS, .d.ts)
 npm run check          # all three
 ```
