@@ -20,6 +20,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Documented the index planner as a preference order rather than a cost model, which
   is what it is, in the README, the querying guide and `planIndex()`.
 
+### Changed
+
+- Extracted the numeric range rule into `query/bounds.ts`. The predicate pass and
+  the index planner derived the tightest bounds independently, so they could have
+  disagreed; they now share one implementation.
+- Replaced `sortValue`'s switch with a `Record<SortField, accessor>` table, so a new
+  sort field without an accessor is a compile error rather than a silent fallback.
+
 ### Fixed
 
 - Reusing a `RegExp` with the `g` or `y` flag in a `where` clause no longer matches

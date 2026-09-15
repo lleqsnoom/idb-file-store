@@ -5,6 +5,7 @@ import { normalizeChunkSize } from './chunk-store.js';
 import { contentHash } from '../utils/hash.js';
 import { extensionOf, mimeFromName, readTextPreview, withExtension } from '../utils/mime.js';
 import { inputName, now, toBlob, toTimestamp } from '../utils/misc.js';
+import type { SearchColumns } from '../utils/record.js';
 import {
   buildSearchColumns,
   normalizeName,
@@ -123,50 +124,127 @@ interface RowInput {
   options: PrepareOptions;
 }
 
+/** The row shape this module produces. */
+type StoredRow = Omit<StoredFile, 'id' | 'chunkCount' | 'chunkSize'>;
+
+/**
+ * Values derived once from a payload and its options.
+ *
+ * Computing them here keeps each field group below a pure projection of the same
+ * inputs, so no group can normalize a tag or a folder differently from another.
+ */
+interface RowContext {
+  input: RowInput;
+  createdAt: number;
+  tags: string[];
+  folder: string;
+  notes: string;
+  metadata: Record<string, JsonValue>;
+  columns: SearchColumns;
+}
+
 /** Maps a prepared payload onto its storage row. Pure: same input, same row. */
-function buildStoredRow(input: RowInput): Omit<StoredFile, 'id' | 'chunkCount' | 'chunkSize'> {
+function buildStoredRow(input: RowInput): StoredRow {
+  const context = rowContext(input);
+  return {
+    ...identityFields(context),
+    ...timestampFields(context),
+    ...placementFields(context),
+    ...contentFields(context),
+  };
+}
+
+function rowContext(input: RowInput): RowContext {
   const { options } = input;
-  const createdAt = toTimestamp(options.createdAt) ?? now();
   const tags = normalizeTags(options.tags);
   const folder = prepareFolder(options.folder);
   const notes = options.notes ?? '';
   const metadata = prepareMetadata(options.metadata);
-  const columns = buildSearchColumns({
-    name: input.name,
-    tags,
-    folder,
-    mime: input.mime,
-    notes,
-    text: input.text,
-    metadata,
-  });
 
   return {
+    input,
+    createdAt: toTimestamp(options.createdAt) ?? now(),
+    tags,
+    folder,
+    notes,
+    metadata,
+    columns: buildSearchColumns({
+      name: input.name,
+      tags,
+      folder,
+      mime: input.mime,
+      notes,
+      text: input.text,
+      metadata,
+    }),
+  };
+}
+
+/** What the payload is: identity, type, size and the content hash. */
+function identityFields(context: RowContext): Pick<
+  StoredRow,
+  'name' | 'nameLower' | 'kind' | 'mime' | 'extension' | 'size' | 'hash' | 'revision'
+> {
+  const { input } = context;
+  return {
     name: input.name,
-    nameLower: columns.nameLower,
+    nameLower: context.columns.nameLower,
     kind: input.kind,
     mime: input.mime,
     extension: extensionOf(input.name),
     size: input.size,
-    createdAt,
-    updatedAt: toTimestamp(options.updatedAt) ?? createdAt,
-    accessedAt: createdAt,
     hash: input.hash,
-    tags,
-    folder,
+    revision: 1,
+  };
+}
+
+/** Creation, modification and last-read times. */
+function timestampFields(
+  context: RowContext,
+): Pick<StoredRow, 'createdAt' | 'updatedAt' | 'accessedAt'> {
+  const { options } = context.input;
+  return {
+    createdAt: context.createdAt,
+    updatedAt: toTimestamp(options.updatedAt) ?? context.createdAt,
+    accessedAt: context.createdAt,
+  };
+}
+
+/** Where the record sits and how it is flagged. */
+function placementFields(
+  context: RowContext,
+): Pick<
+  StoredRow,
+  'tags' | 'tagsLower' | 'folder' | 'favorite' | 'deletedAt' | 'width' | 'height' | 'durationMs'
+> {
+  const { options, preview } = context.input;
+  return {
+    tags: context.tags,
+    tagsLower: context.columns.tagsLower,
+    folder: context.folder,
     favorite: options.favorite ? 1 : 0,
     deletedAt: 0,
-    notes,
-    text: input.text,
-    notesLower: columns.notesLower,
-    textLower: columns.textLower,
-    tagsLower: columns.tagsLower,
-    metaText: columns.metaText,
-    width: options.width ?? input.preview.width ?? null,
-    height: options.height ?? input.preview.height ?? null,
+    width: options.width ?? preview.width ?? null,
+    height: options.height ?? preview.height ?? null,
     durationMs: options.durationMs ?? null,
-    metadata,
-    revision: 1,
+  };
+}
+
+/** What the record says, including the indexed text columns. */
+function contentFields(
+  context: RowContext,
+): Pick<
+  StoredRow,
+  'notes' | 'notesLower' | 'text' | 'textLower' | 'metaText' | 'metadata'
+> {
+  const { columns } = context;
+  return {
+    notes: context.notes,
+    notesLower: columns.notesLower,
+    text: context.input.text,
+    textLower: columns.textLower,
+    metaText: columns.metaText,
+    metadata: context.metadata,
   };
 }
 

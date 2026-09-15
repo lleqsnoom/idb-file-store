@@ -152,6 +152,43 @@ describe('where filters', () => {
     db.close();
   });
 
+  it('intersects range operators, letting the tighter bound win', async () => {
+    const { db } = await seed();
+
+    // 3000 is the tighter floor, so 2000 no longer matches.
+    expect((await db.all({ where: { size: { gt: 1000, gte: 3000 } } })).length).toBe(2);
+    expect((await db.all({ where: { size: { gte: 2000, gt: 2000 } } })).length).toBe(2);
+
+    // An open bound beats an inclusive one at the same value, so the seeded
+    // 1000-byte file drops out.
+    expect((await db.all({ where: { size: { gte: 1000, gt: 1000 } } })).length).toBe(3);
+
+    // between combines with the operators the same way.
+    expect((await db.all({ where: { size: { between: [1000, 4000], lt: 3000 } } })).length).toBe(2);
+    db.close();
+  });
+
+  it('never treats an array as equal to a plain object', async () => {
+    const db = await openDb();
+    await db.add('a', { name: 'a.txt', metadata: { list: ['x'], empty: [] } });
+    await db.add('b', { name: 'b.txt', metadata: { vendor: 'Acme' } });
+
+    // A list expectation means "one of these values", and a stored array is
+    // itself one value, so matching it means nesting it.
+    expect((await db.all({ where: { metadata: { list: ['x'] } } })).length).toBe(0);
+    expect((await db.all({ where: { metadata: { list: [['x']] } } })).length).toBe(1);
+    expect((await db.all({ where: { metadata: { list: [['x'], ['y']] } } })).length).toBe(1);
+    expect((await db.all({ where: { metadata: { list: [['y']] } } })).length).toBe(0);
+
+    // An empty array and an empty object both have zero keys, so a structural
+    // comparison would accept this query against the stored `[]`.
+    expect((await db.all({ where: { metadata: { empty: {} } } })).length).toBe(0);
+
+    expect((await db.all({ where: { metadata: { vendor: 'Acme' } } })).length).toBe(1);
+    expect((await db.all({ where: { metadata: { vendor: {} } } })).length).toBe(0);
+    db.close();
+  });
+
   it('combines clauses with AND semantics', async () => {
     const { db } = await seed();
     const page = await db.list({

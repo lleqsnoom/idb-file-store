@@ -66,7 +66,7 @@ import {
   resolveReadOptions,
   toPublicRecord,
 } from './utils/record.js';
-import { extensionOf } from './utils/mime.js';
+import { extensionOf, normalizeMime } from './utils/mime.js';
 import { createId, inputName, now, toTimestamp } from './utils/misc.js';
 import { normalizeMetadata } from './utils/path.js';
 import { DEFAULT_THUMBNAIL_SIZE } from './utils/thumbnail.js';
@@ -1080,23 +1080,20 @@ export class FileDB {
     }
   }
 
-  /** Loads a record, lets `mutate` change it, then persists and emits an update. */
+  /** Loads a record, lets `mutate` change it, then persists it. */
   async #patch(id: string, mutate: (row: StoredFile) => boolean): Promise<FileRecord | null> {
     this.#assertOpen();
-    try {
-      const updated = await this.transaction(STORE_FILES, 'readwrite', async (tx, wait) => {
+    const updated = await this.#swallowMissing(() =>
+      this.transaction(STORE_FILES, 'readwrite', async (tx, wait) => {
         const row = await this.#requireRow(tx, wait, id);
         mutate(row);
         row.revision += 1;
         row.updatedAt = now();
         await wait(tx.objectStore(STORE_FILES).put(row));
         return row;
-      });
-      return toPublicRecord(updated);
-    } catch (error) {
-      if (error instanceof NotFoundError) return null;
-      throw error;
-    }
+      }),
+    );
+    return updated ? toPublicRecord(updated) : null;
   }
 
   /**
@@ -1228,21 +1225,46 @@ function refreshSearchColumns(row: StoredFile): void {
   row.metaText = columns.metaText;
 }
 
-/** Applies the mutable fields of {@link UpdateOptions} onto a stored row. */
+/**
+ * Applies the mutable fields of {@link UpdateOptions} onto a stored row.
+ *
+ * Grouped by subject, so a change to one concern stays in one place: what the
+ * record is, where it sits, what it says, and how it is measured.
+ */
 function applyUpdateOptions(row: StoredFile, options: UpdateOptions): void {
+  applyIdentityOptions(row, options);
+  applyPlacementOptions(row, options);
+  applyContentOptions(row, options);
+  applyMeasurementOptions(row, options);
+}
+
+/** Name, MIME type and kind. Renaming also re-derives the extension. */
+function applyIdentityOptions(row: StoredFile, options: UpdateOptions): void {
   if (options.name !== undefined) row.name = normalizeName(options.name);
-  if (options.mime !== undefined) row.mime = options.mime.split(';')[0]?.trim().toLowerCase() ?? row.mime;
+  if (options.mime !== undefined) row.mime = normalizeMime(options.mime);
   if (options.kind !== undefined) row.kind = options.kind;
+  if (options.name !== undefined) row.extension = extensionOf(row.name);
+}
+
+/** Tags, folder and the favourite flag. */
+function applyPlacementOptions(row: StoredFile, options: UpdateOptions): void {
   if (options.tags !== undefined) row.tags = normalizeTags(options.tags);
   if (options.folder !== undefined) row.folder = prepareFolder(options.folder);
   if (options.favorite !== undefined) row.favorite = options.favorite ? 1 : 0;
+}
+
+/** Notes, structured metadata and the searchable text. */
+function applyContentOptions(row: StoredFile, options: UpdateOptions): void {
   if (options.notes !== undefined) row.notes = options.notes;
   if (options.metadata !== undefined) row.metadata = prepareMetadata(options.metadata);
   if (options.text !== undefined) row.text = options.text ?? '';
+}
+
+/** Dimensions and duration, which callers supply or clear explicitly. */
+function applyMeasurementOptions(row: StoredFile, options: UpdateOptions): void {
   if (options.width !== undefined) row.width = options.width;
   if (options.height !== undefined) row.height = options.height;
   if (options.durationMs !== undefined) row.durationMs = options.durationMs;
-  if (options.name !== undefined) row.extension = extensionOf(row.name);
 }
 
 function bump(target: Record<string, number>, key: string): void {

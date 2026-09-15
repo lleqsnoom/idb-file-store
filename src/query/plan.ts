@@ -1,6 +1,7 @@
 import { INDEX } from '../storage/schema.js';
 import type { NumberOperators, OneOrMany, StringOperators, TimeFilter, Where } from '../types.js';
 import { normalizeFolder } from '../utils/path.js';
+import { tighterLower, tighterUpper } from './bounds.js';
 import { normalizeTimeOperators } from './match.js';
 
 /**
@@ -200,54 +201,6 @@ function toKeyRange(operators: NumberOperators): IDBKeyRange | null {
   if (!lower) return upper ? IDBKeyRange.upperBound(upper.value, upper.open) : null;
   if (!upper) return IDBKeyRange.lowerBound(lower.value, lower.open);
   return IDBKeyRange.bound(lower.value, upper.value, lower.open, upper.open);
-}
-
-/** A range endpoint and whether it excludes the value it names. */
-interface Bound {
-  value: number;
-  open: boolean;
-}
-
-function tighterLower(operators: NumberOperators): Bound | null {
-  const candidates: Bound[] = [];
-  if (operators.gt !== undefined) candidates.push({ value: operators.gt, open: true });
-  if (operators.gte !== undefined) candidates.push({ value: operators.gte, open: false });
-  if (operators.between) candidates.push({ value: operators.between[0], open: false });
-  return pickBound(candidates, true);
-}
-
-function tighterUpper(operators: NumberOperators): Bound | null {
-  const candidates: Bound[] = [];
-  if (operators.lt !== undefined) candidates.push({ value: operators.lt, open: true });
-  if (operators.lte !== undefined) candidates.push({ value: operators.lte, open: false });
-  if (operators.between) candidates.push({ value: operators.between[1], open: false });
-  return pickBound(candidates, false);
-}
-
-/**
- * Picks the most restrictive candidate.
- *
- * `preferHigher` is `true` for a lower bound (the largest value is tightest) and
- * `false` for an upper bound. A tie is won by the open bound, because excluding
- * the endpoint is stricter than including it.
- */
-function pickBound(candidates: Bound[], preferHigher: boolean): Bound | null {
-  let best: Bound | null = null;
-  for (const candidate of candidates) {
-    if (!best) {
-      best = candidate;
-      continue;
-    }
-    if (candidate.value === best.value) {
-      if (candidate.open) best = candidate;
-      continue;
-    }
-    const tighter = preferHigher
-      ? candidate.value > best.value
-      : candidate.value < best.value;
-    if (tighter) best = candidate;
-  }
-  return best;
 }
 
 function exactPlan(index: string, value: string): IndexPlan {

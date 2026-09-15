@@ -89,35 +89,40 @@ export function scoreRecord(record: StoredFile, search: ResolvedSearch): number 
   let matched = 0;
 
   for (const token of search.tokens) {
-    let best = 0;
-    for (const [field, text] of texts) {
-      if (!text) continue;
-      const weight = FIELD_WEIGHTS[field];
-      if (weight === 0) continue;
-      const score = tokenScore(text, token, search.fuzzy);
-      if (score > 0) {
-        const weighted = weight * score;
-        if (weighted > best) best = weighted;
-      }
+    const best = bestFieldScore(texts, token, search.fuzzy);
+    if (best === 0) {
+      if (search.mode === 'all') return null;
+      continue;
     }
-    if (best > 0) {
-      matched += 1;
-      total += best;
-    } else if (search.mode === 'all') {
-      return null;
-    }
+    matched += 1;
+    total += best;
   }
 
   if (matched === 0) return null;
-  if (search.phrase && search.tokens.length > 1) {
-    for (const [, text] of texts) {
-      if (text.includes(search.phrase)) {
-        total += PHRASE_BONUS;
-        break;
-      }
-    }
+  return (total + phraseBonus(texts, search)) * search.boost;
+}
+
+/** Highest weighted score the token reaches in any of the searched fields. */
+function bestFieldScore(
+  texts: ReadonlyArray<[SearchField, string]>,
+  token: string,
+  fuzzy: boolean,
+): number {
+  let best = 0;
+  for (const [field, text] of texts) {
+    if (!text) continue;
+    const weight = FIELD_WEIGHTS[field];
+    if (weight === 0) continue;
+    const weighted = weight * tokenScore(text, token, fuzzy);
+    if (weighted > best) best = weighted;
   }
-  return total * search.boost;
+  return best;
+}
+
+/** Flat bonus when a multi-token query appears whole inside one field. */
+function phraseBonus(texts: ReadonlyArray<[SearchField, string]>, search: ResolvedSearch): number {
+  if (search.tokens.length < 2 || !search.phrase) return 0;
+  return texts.some(([, text]) => text.includes(search.phrase)) ? PHRASE_BONUS : 0;
 }
 
 /** Collects the lowercase column for each requested field, skipping empties. */

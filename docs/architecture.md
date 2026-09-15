@@ -34,6 +34,7 @@ src/
 
   query/
     match.ts                  where-clause predicates
+    bounds.ts                 the numeric range rule, shared with the planner
     plan.ts                   index selection
     search.ts                 tokenisation, field weights, relevance scoring
     sort.ts                   collation and cursor keys
@@ -205,6 +206,13 @@ applyCursor -> slice(offset, limit)  the page
       v
 read chunks / thumbnails for the page only
 ```
+
+The predicate pass and the planner both need to know which range a numeric filter
+implies, so `bounds.ts` derives it once: the tightest lower bound, the tightest
+upper bound, and an open endpoint beating an inclusive one at the same value.
+`plan.ts` turns those bounds into an `IDBKeyRange`, and `match.ts` tests a value
+against them. One rule, two consumers, so a value a predicate accepts is always a
+value the planned range can reach.
 
 Two properties fall out of this design.
 

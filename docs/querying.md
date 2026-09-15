@@ -131,7 +131,9 @@ displayed.
 ### Metadata
 
 Metadata matches exactly, by dotted path, against the values you stored. A list
-means "any of".
+means "any of", and each entry is compared deeply, so matching a **stored array**
+means nesting it: `{ 'keywords': [['sunset', 'beach']] }`, not
+`{ 'keywords': ['sunset', 'beach'] }`, which asks for a scalar.
 
 ```ts
 await db.add(file, { metadata: { camera: { make: 'Fujifilm', iso: 400 }, keywords: ['sunset'] } });

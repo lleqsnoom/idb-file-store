@@ -443,15 +443,13 @@ function placeholder(text: string): HTMLElement {
 
 /* ---------------------------------------------------------------- upload -- */
 
-async function ingest(files: readonly File[]): Promise<void> {
+function ingest(files: readonly File[]): void {
   if (files.length === 0) return;
-  try {
+  void run(async () => {
     const records = await db.addMany(files, { folder: '/uploads', tags: ['uploaded'] });
     toast(`${records.length} file(s) stored`);
     await refresh();
-  } catch (error) {
-    fail(error);
-  }
+  });
 }
 
 /* ------------------------------------------------------------ sample set -- */
@@ -463,8 +461,8 @@ const SAMPLES: ReadonlyArray<readonly [label: string, hue: number, tags: string[
   ['desert', 45, ['trip', 'warm']],
 ];
 
-async function addSampleFiles(): Promise<void> {
-  try {
+function addSampleFiles(): void {
+  void run(async () => {
     for (const [label, hue, tags] of SAMPLES) {
       const blob = await gradientImage(hue, label);
       await db.add(blob, {
@@ -490,9 +488,7 @@ async function addSampleFiles(): Promise<void> {
 
     toast('Sample files added');
     await refresh();
-  } catch (error) {
-    fail(error);
-  }
+  });
 }
 
 async function gradientImage(hue: number, label: string): Promise<Blob> {
@@ -576,7 +572,7 @@ function wireEvents(): void {
 /** Drop zone, hidden file input and drag feedback. */
 function wireUpload(): void {
   const accept = (files: FileList | null): void => {
-    if (files) void ingest(Array.from(files));
+    if (files) ingest(Array.from(files));
   };
 
   dropZone.addEventListener('click', () => picker.click());
@@ -656,7 +652,7 @@ function wireToolbar(): void {
     controls.layout.textContent = state.layout === 'grid' ? 'Grid' : 'List';
   });
   controls.more.addEventListener('click', () => void refresh(true));
-  controls.sample.addEventListener('click', () => void addSampleFiles());
+  controls.sample.addEventListener('click', () => addSampleFiles());
 
   controls.emptyTrash.addEventListener('click', () => {
     void run(async () => {

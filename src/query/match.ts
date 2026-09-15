@@ -19,52 +19,69 @@ import type {
 } from '../types.js';
 import type { StoredFile } from '../storage/records.js';
 import { getByPath, isInsideFolder, normalizeFolder } from '../utils/path.js';
+import { satisfiesBounds, tighterLower, tighterUpper } from './bounds.js';
 import { toPublicRecord } from '../utils/record.js';
 import { normalizeText } from '../utils/text.js';
 
 export function matchesString(value: string, filter: OneOrMany<string> | StringOperators): boolean {
-  if (typeof filter === 'string') return value.toLowerCase() === filter.toLowerCase();
-  if (Array.isArray(filter)) {
-    const lowered = value.toLowerCase();
-    return (filter as readonly string[]).some((candidate) => candidate.toLowerCase() === lowered);
+  if (typeof filter === 'string' || Array.isArray(filter)) {
+    return matchesLiteral(value, filter as string | readonly string[]);
   }
 
   const operators = filter as StringOperators;
   const lowered = value.toLowerCase();
-  if (operators.eq !== undefined && lowered !== operators.eq.toLowerCase()) return false;
-  if (operators.ne !== undefined && lowered === operators.ne.toLowerCase()) return false;
-  if (operators.contains !== undefined && !lowered.includes(operators.contains.toLowerCase())) {
-    return false;
-  }
-  if (
-    operators.startsWith !== undefined &&
-    !lowered.startsWith(operators.startsWith.toLowerCase())
-  ) {
-    return false;
-  }
-  if (operators.endsWith !== undefined && !lowered.endsWith(operators.endsWith.toLowerCase())) {
-    return false;
-  }
-  if (operators.in && !operators.in.some((candidate) => candidate.toLowerCase() === lowered)) {
-    return false;
-  }
-  if (operators.notIn?.some((candidate) => candidate.toLowerCase() === lowered)) return false;
-  if (operators.regex && !testPattern(operators.regex, value)) return false;
+  return matchesEquality(lowered, operators) && matchesShape(value, lowered, operators);
+}
+
+/** Matches against one literal or a list of them, ignoring case. */
+function matchesLiteral(value: string, filter: string | readonly string[]): boolean {
+  const lowered = value.toLowerCase();
+  const candidates = typeof filter === 'string' ? [filter] : filter;
+  return candidates.some((candidate) => candidate.toLowerCase() === lowered);
+}
+
+/** `eq`, `ne`, `in` and `notIn` ask whether the value is one of a set. */
+function matchesEquality(lowered: string, operators: StringOperators): boolean {
+  const equals = (candidate: string): boolean => candidate.toLowerCase() === lowered;
+
+  if (operators.eq !== undefined && !equals(operators.eq)) return false;
+  if (operators.ne !== undefined && equals(operators.ne)) return false;
+  if (operators.in && !operators.in.some(equals)) return false;
+  if (operators.notIn?.some(equals)) return false;
   return true;
 }
 
+/** `contains`, `startsWith`, `endsWith` and `regex` ask about the value's shape. */
+function matchesShape(raw: string, lowered: string, operators: StringOperators): boolean {
+  const has = (needle: string | undefined): boolean =>
+    needle === undefined || lowered.includes(needle.toLowerCase());
+  const starts = (needle: string | undefined): boolean =>
+    needle === undefined || lowered.startsWith(needle.toLowerCase());
+  const ends = (needle: string | undefined): boolean =>
+    needle === undefined || lowered.endsWith(needle.toLowerCase());
+
+  return (
+    has(operators.contains) &&
+    starts(operators.startsWith) &&
+    ends(operators.endsWith) &&
+    (!operators.regex || testPattern(operators.regex, raw))
+  );
+}
+
 export function matchesNumber(value: number, filter: NumberOperators): boolean {
+  return matchesExactNumber(value, filter) && matchesNumberBounds(value, filter);
+}
+
+/** `eq` and `ne` compare against one number. */
+function matchesExactNumber(value: number, filter: NumberOperators): boolean {
   if (filter.eq !== undefined && value !== filter.eq) return false;
   if (filter.ne !== undefined && value === filter.ne) return false;
-  if (filter.gt !== undefined && !(value > filter.gt)) return false;
-  if (filter.gte !== undefined && !(value >= filter.gte)) return false;
-  if (filter.lt !== undefined && !(value < filter.lt)) return false;
-  if (filter.lte !== undefined && !(value <= filter.lte)) return false;
-  if (filter.between) {
-    const [min, max] = filter.between;
-    if (value < min || value > max) return false;
-  }
   return true;
+}
+
+/** `gt`, `gte`, `lt`, `lte` and `between` place the value in a range. */
+function matchesNumberBounds(value: number, filter: NumberOperators): boolean {
+  return satisfiesBounds(value, tighterLower(filter), tighterUpper(filter));
 }
 
 /** Accepts a `Date`, epoch milliseconds, or the same comparison operators as a number. */
@@ -138,21 +155,31 @@ export function testPattern(pattern: RegExp, value: string): boolean {
   return pattern.test(value);
 }
 
-/** Deep JSON equality, used by metadata filters. */
+/**
+ * Deep JSON equality, used by metadata filters.
+ *
+ * Arrays and plain objects are compared as their own kinds: an array never equals
+ * an object with the same entries, which a structural comparison would accept.
+ */
 export function deepEqualJson(a: unknown, b: JsonValue): boolean {
   if (a === b) return true;
-  if (Array.isArray(a) && Array.isArray(b)) {
-    return a.length === b.length && a.every((item, index) => deepEqualJson(item, b[index]));
-  }
-  if (a !== null && b !== null && typeof a === 'object' && typeof b === 'object') {
-    const left = a as Record<string, unknown>;
-    const right = b as Record<string, JsonValue>;
-    const leftKeys = Object.keys(left);
-    const rightKeys = Object.keys(right);
-    if (leftKeys.length !== rightKeys.length) return false;
-    return leftKeys.every((key) => key in right && deepEqualJson(left[key], right[key]));
-  }
+  if (Array.isArray(a) && Array.isArray(b)) return equalArrays(a, b);
+  if (isJsonObject(a) && isJsonObject(b)) return equalObjects(a, b);
   return false;
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function equalArrays(a: readonly unknown[], b: readonly JsonValue[]): boolean {
+  return a.length === b.length && a.every((item, index) => deepEqualJson(item, b[index]));
+}
+
+function equalObjects(a: Record<string, unknown>, b: Record<string, JsonValue>): boolean {
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every((key) => key in b && deepEqualJson(a[key], b[key]));
 }
 
 /**
