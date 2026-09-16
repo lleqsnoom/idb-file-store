@@ -106,7 +106,8 @@ below.
 The store is addressed by **content**, not by record: `contentId` is the payload's hash
 when one was computed and a private id otherwise. Two records with identical bytes
 resolve to the same keys and share one copy, while unhashed payloads stay independent.
-Version 1 keyed this store by record id; the version 2 upgrade rekeys it.
+Version 1 keyed this store by record id; the version 2 upgrade rekeys it, and the version
+3 upgrade re-runs that rekey for a database that reports version 2 without it.
 
 ### `thumbnails` — generated previews
 
@@ -306,7 +307,7 @@ subsequent call fails with `ClosedError` rather than operating on a dead handle.
 single place schema changes belong.
 
 ```ts
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export function upgradeSchema(db: IDBDatabase, oldVersion: number): void {
   if (oldVersion < 1) {
@@ -328,6 +329,12 @@ Rules that keep upgrades safe:
   version 2 through the same code a fresh database runs from version 0.
 - The callback runs inside `onupgradeneeded`, so it must only use the supplied
   transaction. It is synchronous by contract.
+- **A version number does not prove a shape.** A database can report a version without
+  holding what that version is supposed to mean: version 3 exists because an
+  intermediate build raised the number to 2 before the rekeying step landed, so those
+  databases keep record-keyed chunks while reading as current. A step whose only guard
+  is `oldVersion < N` cannot repair them; check the store (`indexNames`, `keyPath`) and
+  re-run the step when the shape says it is needed.
 - Raising `FileDB({ version })` is a deliberate act. If any tab still holds an
   older connection, the upgrade blocks until it closes; `onBlocked` is where you
   surface that to the user.
