@@ -8,7 +8,9 @@
  *   the query planner hand most filters straight to IndexedDB instead of
  *   scanning every record.
  * - `chunks`: the bytes, split into fixed-size pieces keyed by `[contentId, index]`, so
- *   records sharing identical bytes share one copy.
+ *   records sharing identical bytes share one copy. Version 1 keyed this store by
+ *   record id; version 2 rekeys it, and version 3 re-runs that rekey for databases
+ *   that report version 2 without having had it.
  * - `thumbnails`: generated previews, kept out of `files` so listings stay small.
  * - `meta`: schema bookkeeping and per-database settings.
  */
@@ -19,9 +21,10 @@ import type { StoredChunk, StoredFile } from './records.js';
  * Current schema version. Bump it and add a step in {@link upgradeSchema} to migrate.
  *
  * Version 2 keys the chunk store by content id instead of record id, so records with
- * identical bytes reference one copy.
+ * identical bytes reference one copy. Version 3 re-runs that rekey when a database
+ * reports version 2 but still holds record-keyed chunks.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** Object store holding file metadata. */
 export const STORE_FILES = 'files';
@@ -81,18 +84,40 @@ export function upgradeSchema(
     createMetaStore(db);
   }
   if (oldVersion >= 1 && oldVersion < 2) {
-    if (!transaction) {
-      throw new Error('Migrating to schema version 2 needs the version-change transaction');
-    }
-    migrateToContentKeys(db, transaction);
+    migrateToContentKeys(db, requireTransaction(transaction, 2));
   }
+  if (oldVersion >= 2 && oldVersion < 3) {
+    // A database can report version 2 and still hold the version 1 chunk layout: an
+    // intermediate build raised the number before the rekeying step existed. The
+    // version cannot reveal that, the store's shape can, so the rekey runs again when
+    // the chunks are not content-keyed.
+    const versionChange = requireTransaction(transaction, 3);
+    if (needsContentKeys(versionChange)) migrateToContentKeys(db, versionChange);
+  }
+}
+
+/** The version-change transaction, or an error naming the migration that needs it. */
+function requireTransaction(transaction: IDBTransaction | undefined, target: number): IDBTransaction {
+  if (!transaction) {
+    throw new Error(`Migrating to schema version ${target} needs the version-change transaction`);
+  }
+  return transaction;
+}
+
+/** `true` when the chunk store is not keyed by content, whatever the version says. */
+function needsContentKeys(transaction: IDBTransaction): boolean {
+  return !transaction.objectStore(STORE_CHUNKS).indexNames.contains(CHUNK_INDEX.contentId);
 }
 
 /** Temporary store used while the chunk store is recreated under a new key. */
 const STAGING_CHUNKS = 'chunks_staging';
 
 /**
- * Rekeys a version 1 database so chunks are addressed by content instead of by record.
+ * Rekeys a database so chunks are addressed by content instead of by record.
+ *
+ * Runs for version 1 databases, and again for a version 2 database whose chunks are
+ * still record-keyed. Rows that already carry a content id pass through unchanged, so
+ * re-running it on a partly migrated database is safe.
  *
  * An object store's key path cannot be changed in place, so the rows are staged in a
  * temporary store while the real one is recreated. Both copies stream through cursors,

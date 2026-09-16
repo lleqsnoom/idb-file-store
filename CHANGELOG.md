@@ -36,6 +36,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `restoreBackup()` recomputes hashes rather than trusting the ones recorded in a backup,
   so a corrupt backup cannot alias the wrong content to a record. This also means a
   restored database keeps the sharing the original had.
+- Reading the bytes of a record no longer fails with `Transaction failed: Failed to execute
+  'index' on 'IDBObjectStore'` on a database that reports schema version 2 while its chunks
+  are still keyed by record id. **Schema version 3** re-runs the rekeying step for those
+  databases on the next open, so the version they claim is no longer trusted over the
+  shape they hold.
 
 ### Changed
 

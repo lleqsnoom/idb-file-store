@@ -118,6 +118,28 @@ async function seedVersionOne(
   db.close();
 }
 
+/**
+ * Builds the state a browser can be left in by an intermediate build: the database
+ * reports schema version 2 while its chunks are still keyed by record id, because the
+ * version was raised before the rekeying migration existed.
+ */
+async function seedStaleVersionTwo(
+  factory: IDBFactory,
+  name: string,
+  entries: ReadonlyArray<{ name: string; hash: string | null; bytes: ArrayBuffer }>,
+): Promise<void> {
+  await seedVersionOne(factory, name, entries);
+  await new Promise<void>((resolve, reject) => {
+    const open = factory.open(name, 2);
+    open.onupgradeneeded = () => undefined;
+    open.onsuccess = () => {
+      open.result.close();
+      resolve();
+    };
+    open.onerror = () => reject(open.error);
+  });
+}
+
 describe('FileDB lifecycle', () => {
   it('opens lazily and reports its state', async () => {
     const db = new FileDB({ name: 'lifecycle', syncTabs: false });
@@ -740,6 +762,44 @@ describe('schema migration', () => {
     const page = await db.all();
     expect(page[0]?.contentId).toBe('v1-record-0');
     expect((await db.getBlob(page[0]?.id as string)).size).toBe(20);
+    db.close();
+  });
+
+  it('rekeys a version 2 database left with record-keyed chunks', async () => {
+    const factory = new IDBFactory();
+    const name = 'stale-v2';
+    await seedStaleVersionTwo(factory, name, [
+      { name: 'a.bin', hash: 'sha256:aaa', bytes: await makeBlob(64).arrayBuffer() },
+      { name: 'b.bin', hash: 'sha256:bbb', bytes: await makeBlob(32).arrayBuffer() },
+    ]);
+
+    const db = await FileDB.open({ name, indexedDB: factory, syncTabs: false });
+    const page = await db.all({ sort: { by: 'name' } });
+
+    expect(page.map((record) => record.contentId)).toEqual(['sha256:aaa', 'sha256:bbb']);
+    expect((await db.getBlob(page[0]?.id as string)).size).toBe(64);
+    expect((await db.getBlob(page[1]?.id as string)).size).toBe(32);
+    expect(
+      await db.transaction('chunks', 'readonly', (tx) =>
+        tx.objectStore('chunks').indexNames.contains('by_content'),
+      ),
+    ).toBe(true);
+    db.close();
+  });
+
+  it('leaves a database whose chunks are already content-keyed alone', async () => {
+    const factory = new IDBFactory();
+    const name = 'current-v2';
+    const seeded = await openDb({ indexedDB: factory, name });
+    const record = await seeded.add(makeBlob(40), { name: 'a.bin' });
+    seeded.close();
+
+    const db = await FileDB.open({ name, indexedDB: factory, syncTabs: false });
+    const page = await db.all();
+
+    expect(page.map((r) => r.contentId)).toEqual([record.contentId]);
+    expect((await db.getBlob(record.id)).size).toBe(40);
+    expect(await chunkCountFor(db, record.contentId)).toBe(1);
     db.close();
   });
 });

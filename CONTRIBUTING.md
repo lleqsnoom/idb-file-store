@@ -79,6 +79,10 @@ people already have.
 2. Add an **additive** step to `upgradeSchema()` guarded by `oldVersion < N`.
 3. Test both paths: a fresh database created at the new version, and a database
    created at the old version that is then reopened at the new one.
+4. If the step changes the shape of a store, also test a database that already reports
+   the version you are leaving, but without the shape: a version number can be raised
+   before the step that gives it meaning exists, and a guard of `oldVersion < N` alone
+   will skip those databases (see the version 3 repair for an example).
 
 Never modify an existing step. A version 1 database must still migrate through the
 exact code that created it.
