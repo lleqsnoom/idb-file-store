@@ -129,3 +129,24 @@ alternatives.
 
 If you are planning something large, open an issue first. It is much easier to
 agree on an approach before the code exists.
+
+## Releasing
+
+Merging to `main` publishes to npm. There is no release step to run and no version to
+bump by hand: `.github/workflows/publish.yml` reads the conventional commits since
+the last `v*` tag, applies that semver bump (`feat:` minor, `fix:` and `perf:`
+patch, `BREAKING CHANGE:` or `!` major) on top of the version already published on
+npm, dates the `## [Unreleased]` changelog section, commits the result and pushes
+the `v<version>` tag.
+
+What that means for a contributor:
+
+- Write the changelog entry under `## [Unreleased]` as part of the change. The
+  release job promotes that section; if it is empty the release falls back to the
+  commit subjects, which reads worse.
+- Keep the commit or pull request title conventional. It is the input to the version
+  bump, and a subject outside the convention releases nothing.
+- Do not bump the version in `package.json`, and do not tag.
+
+`AGENTS.md` documents the mechanics, including the trusted publisher the npm
+account needs.

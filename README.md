@@ -55,7 +55,9 @@ The package is not on npm yet, so install it from GitHub:
 npm install github:lleqsnoom/idb-file-store
 ```
 
-Once it is published, `npm install idb-file-store` will work instead.
+Once it is published, `npm install idb-file-store` will work instead. Releases are
+cut automatically on every merge to `main`, so the npm name appears with the first
+release.
 
 ## Quick start
 
