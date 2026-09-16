@@ -61,6 +61,14 @@ const FIELD_WEIGHTS: Record<SearchField, number> = {
 const FUZZY_MIN_LENGTH = 4;
 const PHRASE_BONUS = 6;
 
+/** What each kind of token hit is worth, before field weighting. */
+const WORD_START_SCORE = 1;
+const MID_WORD_SCORE = 0.6;
+const FUZZY_SCORE = 0.35;
+/** Added per extra occurrence of a token, for the first three repeats. */
+const REPEAT_STEP = 0.15;
+const MAX_COUNTED_REPEATS = 3;
+
 /** Resolves a search input into a {@link ResolvedSearch}, or `null` when empty. */
 export function resolveSearch(search: string | SearchQuery | undefined): ResolvedSearch | null {
   if (search === undefined) return null;
@@ -169,14 +177,14 @@ function tokenScore(text: string, token: string, fuzzy: boolean): number {
     const previous = index === 0 ? ' ' : text[index - 1];
     const atWordStart = previous === undefined || !/[a-z0-9]/.test(previous);
     const occurrences = countOccurrences(text, token);
-    const repetition = Math.min(occurrences - 1, 3) * 0.15;
-    return atWordStart ? 1 + repetition : 0.6 + repetition;
+    const repetition = Math.min(occurrences - 1, MAX_COUNTED_REPEATS) * REPEAT_STEP;
+    return (atWordStart ? WORD_START_SCORE : MID_WORD_SCORE) + repetition;
   }
 
   if (!fuzzy || token.length < FUZZY_MIN_LENGTH) return 0;
   for (const candidate of matchTokens(text)) {
     if (candidate.length < FUZZY_MIN_LENGTH) continue;
-    if (boundedLevenshtein(candidate, token, 1) <= 1) return 0.35;
+    if (boundedLevenshtein(candidate, token, 1) <= 1) return FUZZY_SCORE;
   }
   return 0;
 }

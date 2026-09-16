@@ -91,6 +91,9 @@ export function matchesTime(value: number, filter: TimeFilter): boolean {
   return matchesNumber(value, normalizeTimeOperators(filter));
 }
 
+/** Numeric operators that carry exactly one value. */
+const SINGLE_VALUE_OPERATORS = ['eq', 'ne', 'gt', 'gte', 'lt', 'lte'] as const;
+
 /** Converts a `Date`-bearing operator object into a plain numeric one. */
 export function normalizeTimeOperators(
   filter: Exclude<TimeFilter, Date | number>,
@@ -99,18 +102,10 @@ export function normalizeTimeOperators(
     value === undefined ? undefined : value instanceof Date ? value.getTime() : value;
 
   const out: NumberOperators = {};
-  const eq = at(filter.eq);
-  if (eq !== undefined) out.eq = eq;
-  const ne = at(filter.ne);
-  if (ne !== undefined) out.ne = ne;
-  const gt = at(filter.gt);
-  if (gt !== undefined) out.gt = gt;
-  const gte = at(filter.gte);
-  if (gte !== undefined) out.gte = gte;
-  const lt = at(filter.lt);
-  if (lt !== undefined) out.lt = lt;
-  const lte = at(filter.lte);
-  if (lte !== undefined) out.lte = lte;
+  for (const operator of SINGLE_VALUE_OPERATORS) {
+    const value = at(filter[operator]);
+    if (value !== undefined) out[operator] = value;
+  }
   if (filter.between) {
     out.between = [at(filter.between[0]) as number, at(filter.between[1]) as number];
   }

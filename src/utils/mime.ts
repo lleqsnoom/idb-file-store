@@ -149,7 +149,7 @@ const KIND_BY_MIME: Record<string, FileKind> = {
 const CODE_MIME_PATTERN =
   /(javascript|typescript|json|xml|yaml|toml|x-shellscript|x-python|x-ruby|x-go|x-rust|x-java|x-kotlin|x-c|x-c\+\+|x-csharp|x-php|x-swift|x-sql)/;
 
-/** Extracts the lowercased extension (without the dot) from a file name. */
+/** The extension without the dot, lowercased, or an empty string when there is none. */
 export function extensionOf(name: string): string {
   const base = baseName(name);
   const dot = base.lastIndexOf('.');

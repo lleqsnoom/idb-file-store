@@ -37,9 +37,7 @@ import {
 import type { StoredFile, StoredThumbnail } from './storage/records.js';
 import { prepareWrite, type PreparedWrite } from './storage/prepare.js';
 import { planIndex, type IndexPlan } from './query/plan.js';
-import { matchesRecord } from './query/match.js';
-import { countRecords, selectRecords, type Selection } from './query/select.js';
-import { resolveSearch, scoreRecord } from './query/search.js';
+import { countRecords, matchedRows, selectRecords, type Selection } from './query/select.js';
 import { INDEX } from './storage/schema.js';
 import type {
   AddOptions,
@@ -302,7 +300,6 @@ export class FileDB {
   /* Create                                                                 */
   /* ---------------------------------------------------------------------- */
 
-  /** Stores a new file and returns its record. */
   async add(input: FileInput, options: AddOptions = {}): Promise<FileRecord> {
     const id = options.id ?? createId();
     const prepared = await prepareWrite(input, options, id, this.#options);
@@ -330,20 +327,8 @@ export class FileDB {
         const clash = await wait(store.get(row.id) as IDBRequest<StoredFile | undefined>);
         if (clash) throw new ValidationError(`A record with id "${row.id}" already exists`);
 
-        const layout = await this.#storeContent(
-          tx,
-          wait,
-          row.contentId,
-          row.hash,
-          prepared.blob,
-          prepared.chunkSize,
-        );
-        row.chunkCount = layout.chunkCount;
-        row.chunkSize = layout.chunkSize;
+        await this.#writeContent(tx, wait, row, prepared);
         await wait(store.put(row));
-        if (prepared.thumbnail) {
-          await wait(tx.objectStore(STORE_THUMBS).put(prepared.thumbnail));
-        }
       },
     );
 
@@ -403,7 +388,7 @@ export class FileDB {
     });
   }
 
-  /** Reads the raw bytes of a file. */
+  /** Reassembles every chunk, so a large file is materialised in memory. */
   async getBlob(id: string): Promise<Blob> {
     this.#assertOpen();
     return this.transaction([STORE_FILES, STORE_CHUNKS], 'readonly', async (tx, wait) => {
@@ -487,7 +472,6 @@ export class FileDB {
   /* Update                                                                 */
   /* ---------------------------------------------------------------------- */
 
-  /** Applies a partial change to one record. */
   async update(id: string, options: UpdateOptions = {}): Promise<FileRecord> {
     let replacement: PreparedWrite | null = null;
     if (options.data) {
@@ -514,30 +498,11 @@ export class FileDB {
         const next: StoredFile = { ...row };
 
         if (replacement) {
-          next.contentId = replacement.row.contentId;
-          const layout = await this.#storeContent(
-            tx,
-            wait,
-            next.contentId,
-            next.hash,
-            replacement.blob,
-            replacement.chunkSize,
-          );
-          next.chunkCount = layout.chunkCount;
-          next.chunkSize = layout.chunkSize;
-          next.size = replacement.blob.size;
-          next.mime = replacement.row.mime;
-          next.extension = replacement.row.extension;
-          next.kind = replacement.row.kind;
-          next.hash = replacement.row.hash;
-          next.text = replacement.row.text;
-          next.textLower = replacement.row.textLower;
-          next.width = replacement.row.width;
-          next.height = replacement.row.height;
-          next.durationMs = replacement.row.durationMs;
+          await this.#writeContent(tx, wait, next, replacement);
+          this.#applyContentReplacement(next, replacement);
           const thumbs = tx.objectStore(STORE_THUMBS);
-          if (thumbnail) await wait(thumbs.put(thumbnail));
-          else await wait(thumbs.delete(id));
+          // A replacement without a preview must not leave the old one behind.
+          if (!thumbnail) await wait(thumbs.delete(id));
         }
 
         applyUpdateOptions(next, options);
@@ -672,7 +637,7 @@ export class FileDB {
     return this.purge(ids);
   }
 
-  /** Empties every store. The database itself stays in place. */
+  /** Empties every store but keeps the database, unlike {@link FileDB.destroy}. */
   async clear(): Promise<void> {
     await this.transaction([...ALL_STORES], 'readwrite', async (tx, wait) => {
       for (const name of ALL_STORES) {
@@ -778,15 +743,12 @@ export class FileDB {
       return;
     }
 
-    const search = resolveSearch(options.search);
     const keys = await this.#collectKeys(options.where);
     for (let index = 0; index < keys.length; index += STREAM_BATCH) {
       if (options.signal?.aborted) return;
       const batch = keys.slice(index, index + STREAM_BATCH);
       const rows = await this.#getManyRows(batch);
-      for (const row of rows) {
-        if (!matchesRecord(row, options.where)) continue;
-        if (search && scoreRecord(row, search) === null) continue;
+      for (const { row } of matchedRows(rows, options)) {
         yield toPublicRecord(row);
       }
     }
@@ -796,7 +758,6 @@ export class FileDB {
   async facets(query: Query = {}): Promise<Facets> {
     const where: Where = { ...query.where, deleted: query.where?.deleted ?? false };
     const candidates = await this.#candidates(where);
-    const search = resolveSearch(query.search);
 
     const facets: Facets = {
       count: 0,
@@ -809,24 +770,13 @@ export class FileDB {
       byFolder: {},
     };
 
-    for (const row of candidates) {
-      if (!matchesRecord(row, where)) continue;
-      if (search && scoreRecord(row, search) === null) continue;
-
+    for (const { row } of matchedRows(candidates, { where, search: query.search })) {
       facets.count += 1;
       facets.size += row.size;
-      facets.sizeRange.min =
-        facets.sizeRange.min === null ? row.size : Math.min(facets.sizeRange.min, row.size);
-      facets.sizeRange.max =
-        facets.sizeRange.max === null ? row.size : Math.max(facets.sizeRange.max, row.size);
-      facets.dateRange.oldest =
-        facets.dateRange.oldest === null
-          ? row.createdAt
-          : Math.min(facets.dateRange.oldest, row.createdAt);
-      facets.dateRange.newest =
-        facets.dateRange.newest === null
-          ? row.createdAt
-          : Math.max(facets.dateRange.newest, row.createdAt);
+      facets.sizeRange.min = minOf(facets.sizeRange.min, row.size);
+      facets.sizeRange.max = maxOf(facets.sizeRange.max, row.size);
+      facets.dateRange.oldest = minOf(facets.dateRange.oldest, row.createdAt);
+      facets.dateRange.newest = maxOf(facets.dateRange.newest, row.createdAt);
 
       bump(facets.byKind, row.kind);
       bump(facets.byExtension, row.extension || '(none)');
@@ -863,8 +813,8 @@ export class FileDB {
       size += row.size;
       bumpSize(byKind, row.kind, row.size);
       bumpSize(byMime, row.mime, row.size);
-      oldest = oldest === null ? row.createdAt : Math.min(oldest, row.createdAt);
-      newest = newest === null ? row.createdAt : Math.max(newest, row.createdAt);
+      oldest = minOf(oldest, row.createdAt);
+      newest = maxOf(newest, row.createdAt);
     }
 
     return {
@@ -1069,6 +1019,53 @@ export class FileDB {
       await deleteChunks(tx, wait, contentId);
     }
     return writeChunks(tx, wait, contentId, blob, chunkSize);
+  }
+
+  /**
+   * Writes a prepared payload, points `row` at the layout it ended up with, and stores
+   * its preview when it has one.
+   *
+   * `add` and `update` need the same three steps in the same order, so they share them
+   * here. The hash comes from the prepared row rather than the row being written: on an
+   * update the row still carries the previous payload's hash, and `#storeContent` would
+   * then adopt the layout of the content being replaced instead of the one being reused.
+   */
+  async #writeContent(
+    tx: IDBTransaction,
+    wait: Wait,
+    row: StoredFile,
+    prepared: PreparedWrite,
+  ): Promise<void> {
+    const layout = await this.#storeContent(
+      tx,
+      wait,
+      prepared.row.contentId,
+      prepared.row.hash,
+      prepared.blob,
+      prepared.chunkSize,
+    );
+    row.chunkCount = layout.chunkCount;
+    row.chunkSize = layout.chunkSize;
+    if (prepared.thumbnail) {
+      await wait(tx.objectStore(STORE_THUMBS).put(prepared.thumbnail));
+    }
+  }
+
+  /**
+   * Gives a replaced record the columns its new payload owns.
+   *
+   * Everything else on the row is either caller-supplied (`applyUpdateOptions`) or the
+   * layout `#writeContent` just wrote, so exactly these columns change: copying the
+   * prepared row wholesale would reset tags, folder, notes and timestamps to the
+   * defaults the update options did not mention.
+   */
+  #applyContentReplacement(
+    next: StoredFile,
+    replacement: PreparedWrite,
+  ): void {
+    next.contentId = replacement.row.contentId;
+    next.size = replacement.blob.size;
+    for (const field of CONTENT_FIELDS) copyField(next, replacement.row, field);
   }
 
   /**
@@ -1363,6 +1360,43 @@ function applyMeasurementOptions(row: StoredFile, options: UpdateOptions): void 
   if (options.width !== undefined) row.width = options.width;
   if (options.height !== undefined) row.height = options.height;
   if (options.durationMs !== undefined) row.durationMs = options.durationMs;
+}
+
+/**
+ * Columns a payload owns outright when it replaces a record's bytes.
+ *
+ * The rest of the row is either supplied by the caller or derived from the write, so
+ * a new derived column belongs in this list or it stays at the value it had.
+ */
+const CONTENT_FIELDS = [
+  'mime',
+  'extension',
+  'kind',
+  'hash',
+  'text',
+  'textLower',
+  'width',
+  'height',
+  'durationMs',
+] as const satisfies readonly (keyof StoredFile)[];
+
+/** Copies one stored column, keeping the key and the value types in step. */
+function copyField<K extends keyof StoredFile>(
+  target: StoredFile,
+  source: Pick<StoredFile, K>,
+  key: K,
+): void {
+  target[key] = source[key];
+}
+
+/** Smallest of the two, where `null` means the range has not seen a value yet. */
+function minOf(current: number | null, value: number): number {
+  return current === null ? value : Math.min(current, value);
+}
+
+/** Largest of the two, where `null` means the range has not seen a value yet. */
+function maxOf(current: number | null, value: number): number {
+  return current === null ? value : Math.max(current, value);
 }
 
 function bump(target: Record<string, number>, key: string): void {

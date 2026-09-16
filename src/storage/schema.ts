@@ -217,9 +217,10 @@ function rewriteRecords(transaction: IDBTransaction): void {
 /**
  * Visits every row of a store through a cursor.
  *
- * Cursors, rather than `getAll`, keep memory bounded to one row. The `visit` callback
- * must not await: issuing requests from the cursor handler is what keeps the
- * version-change transaction alive.
+ * Cursors, rather than `getAll`, keep memory bounded to one row. None of the three
+ * callbacks may await: issuing requests from the cursor handler is what keeps the
+ * version-change transaction alive. `fail` is expected to abort that transaction,
+ * which is what leaves a half-migrated database on the version it started on.
  */
 function eachRow(
   source: IDBObjectStore | IDBIndex,

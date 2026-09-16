@@ -44,18 +44,29 @@ export interface Selection {
   limit: number;
 }
 
-/** Applies `query` to an already-filtered-by-index candidate set. */
-export function selectRecords(candidates: readonly StoredFile[], query: Query): Selection {
+/**
+ * The candidates that satisfy a query's `where` and `search`, with their score.
+ *
+ * `list`, `iterate` and `facets` all reduce the same candidate set, so they filter
+ * and score through this and cannot drift apart.
+ */
+export function* matchedRows(
+  candidates: readonly StoredFile[],
+  query: Pick<Query, 'where' | 'search'>,
+): Generator<SelectedRow, void, undefined> {
   const search = resolveSearch(query.search);
-  const sorts = normalizeSorts(query.sort);
-
-  const scored: SelectedRow[] = [];
   for (const row of candidates) {
     if (!matchesRecord(row, query.where)) continue;
     const score = search ? scoreRecord(row, search) : null;
     if (search && score === null) continue;
-    scored.push({ row, score });
+    yield { row, score };
   }
+}
+
+/** Applies `query` to an already-filtered-by-index candidate set. */
+export function selectRecords(candidates: readonly StoredFile[], query: Query): Selection {
+  const sorts = normalizeSorts(query.sort);
+  const scored = [...matchedRows(candidates, query)];
 
   scored.sort((a, b) => {
     if (a.score !== null && b.score !== null && a.score !== b.score) return b.score - a.score;
@@ -107,7 +118,16 @@ function normalizeOffset(offset: number | undefined): number {
   return Math.floor(offset);
 }
 
-/** Counts rows matching a query without materialising a page. */
+/**
+ * Counts rows matching a query without materialising a page.
+ *
+ * It runs the same filter-and-score gate as {@link selectRecords} and stops there:
+ * counting needs neither the ordering nor the cursor work, and the comparator sorts
+ * with natural collation, which is the expensive part of a large candidate set.
+ */
 export function countRecords(candidates: readonly StoredFile[], query: Query): number {
-  return selectRecords(candidates, { ...query, limit: 1, offset: 0, cursor: null }).total;
+  const matched = matchedRows(candidates, query);
+  let total = 0;
+  while (!matched.next().done) total += 1;
+  return total;
 }

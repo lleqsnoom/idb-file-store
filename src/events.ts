@@ -64,7 +64,6 @@ export class Emitter<M extends EventMap> {
     return this.#listeners.get(event)?.size ?? 0;
   }
 
-  /** Removes every listener for every event. */
   removeAll(): void {
     this.#listeners.clear();
   }

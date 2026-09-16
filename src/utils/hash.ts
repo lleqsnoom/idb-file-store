@@ -28,7 +28,7 @@ export async function contentHash(blob: Blob): Promise<string> {
   return hashBytes(bytes);
 }
 
-/** Hashes an in-memory buffer. */
+/** Returns `sha256:<hex>`, or `fnv128x:<hex>` when WebCrypto is unavailable. */
 export async function hashBytes(bytes: Uint8Array): Promise<string> {
   if (supportsWebCrypto()) {
     const digest = await globalThis.crypto.subtle.digest('SHA-256', toArrayBuffer(bytes));
