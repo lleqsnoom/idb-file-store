@@ -1,0 +1,148 @@
+name: Release (versioned npm publish on merge to main)
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # to commit the version bump and push the release tag
+  id-token: write # to authenticate the publish with OIDC and sign the provenance
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # every tag and commit, so the version analysis is complete
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # Trusted publishing needs npm >= 11.5.1, and the bundled npm can lag behind.
+      - name: Ensure npm supports trusted publishing
+        run: |
+          npm install --global npm@latest
+          npm --version
+
+      - name: Install dependencies
+        run: npm ci --registry=https://registry.npmjs.org/
+
+      # The publish ships dist/, which is gitignored, so it must be built here.
+      # This is also the same gate CI runs: typecheck, tests, build.
+      - name: Typecheck, test and build
+        run: npm run check
+
+      # Step 1: Determine the bump the commits warrant (feat -> minor, fix/perf -> patch,
+      # "!" or a BREAKING CHANGE footer -> major, everything else -> none).
+      - name: Analyze the commits since the last tag for the semver bump
+        id: bump-type
+        run: |
+          LAST_TAG=$(git tag --list 'v*' | sort -V | tail -1 || echo "")
+
+          if [ -z "$LAST_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"%s")
+          else
+            COMMITS=$(git log "${LAST_TAG}..HEAD" --pretty=format:"%s")
+          fi
+
+          BUMP_TYPE=$(printf '%s' "$COMMITS" | node scripts/version-bump.cjs)
+
+          echo "type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
+          echo "::notice::Commit analysis suggests: $BUMP_TYPE"
+
+      # Step 2: The npm registry is the authority on what has been released, not the
+      # git tags, so a failed or partial run can never publish a version twice.
+      - name: Read the latest published version from npm
+        id: npm-latest
+        run: |
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          LATEST_NPM=$(npm view "$PACKAGE_NAME" version 2>/dev/null || echo "0.0.0")
+
+          echo "version=$LATEST_NPM" >> "$GITHUB_OUTPUT"
+          echo "::notice::Latest on npm: $LATEST_NPM"
+
+      # Step 3: Apply that bump on top of the npm version. A merge with nothing
+      # releasable in it still ships a patch, so main and npm never drift.
+      - name: Calculate and apply the new version
+        run: |
+          LATEST_NPM="${{ steps.npm-latest.outputs.version }}"
+          BUMP_TYPE="${{ steps.bump-type.outputs.type }}"
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST_NPM"
+
+          case "$BUMP_TYPE" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            *) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+
+          # Updates package.json and package-lock.json together.
+          npm version "$NEW_VERSION" --no-git-tag-version --allow-same-version --force
+
+          echo "::notice::Bumping npm $LATEST_NPM -> $NEW_VERSION ($BUMP_TYPE)"
+
+      # Step 4: Date the unreleased changelog section and open a fresh one.
+      - name: Promote the unreleased changelog section
+        run: |
+          LAST_TAG=$(git tag --list 'v*' | sort -V | tail -1 || echo "")
+
+          if [ -z "$LAST_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"%s")
+          else
+            COMMITS=$(git log "${LAST_TAG}..HEAD" --pretty=format:"%s")
+          fi
+
+          NEW_VERSION=$(node -p "require('./package.json').version")
+
+          printf '%s' "$COMMITS" |
+            node scripts/changelog.cjs "$NEW_VERSION" "$(date +%Y-%m-%d)"
+
+      # Step 5: Commit the bump and the changelog so main records the release.
+      - name: Commit the version bump and the changelog
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          NEW_VERSION=$(node -p "require('./package.json').version")
+
+          git add package.json package-lock.json CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(release): v$NEW_VERSION"
+
+      # Step 6: Publish to npm with OIDC trusted publishing and provenance.
+      - name: Publish to npmjs
+        run: npm publish --provenance --access=public
+
+      # Step 7: Push the release commit and tag it.
+      - name: Push the release commit and tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          TAG="v$NEW_VERSION"
+
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists, skipping."
+          else
+            git tag "$TAG"
+          fi
+
+          git push origin "HEAD:main" "$TAG"
