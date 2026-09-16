@@ -121,7 +121,6 @@ export function toPublicRecord(
   return record;
 }
 
-/** Merges read options with their defaults. */
 export function resolveReadOptions(options: ReadOptions | undefined): Required<ReadOptions> {
   return {
     includeBlob: options?.includeBlob ?? false,

@@ -587,8 +587,8 @@ detail.
 interface StorageStats {
   count: number;
   size: number;          // logical: the sum of record sizes
-  physicalSize: number;  // bytes actually held in the chunk store
-  sharedBytes: number;   // size - physicalSize
+  physicalSize: number;  // bytes held in the chunk store, trashed content included
+  sharedBytes: number;   // size - physicalSize, floored at zero
   trashedCount: number;
   trashedSize: number;
   byKind: Record<string, { count: number; size: number }>;

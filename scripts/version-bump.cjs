@@ -18,6 +18,9 @@
  *   git log --pretty=format:"%s" v1.0.0..HEAD | node scripts/version-bump.cjs
  */
 
+/** Ordering of the bump types, so the highest one can be kept without branching. */
+const RELEASE_RANK = { none: 0, patch: 1, minor: 2, major: 3 };
+
 const CONVENTIONAL_TYPES = {
   feat: "minor",
   fix: "patch",
@@ -53,13 +56,7 @@ function getReleaseType(commits) {
   for (const message of commits) {
     const bump = getBumpType(message);
     if (!bump) continue;
-
-    // major > minor > patch > none
-    if (bump === "major") return "major";
-    if (bump === "minor" && highest !== "major") highest = "minor";
-    else if (bump === "patch" && !highest.includes("minor")) {
-      if (!highest || highest === "none") highest = "patch";
-    }
+    if (RELEASE_RANK[bump] > RELEASE_RANK[highest]) highest = bump;
   }
 
   return highest;

@@ -41,6 +41,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   are still keyed by record id. **Schema version 3** re-runs the rekeying step for those
   databases on the next open, so the version they claim is no longer trusted over the
   shape they hold.
+- Replacing a record's bytes with bytes that already exist no longer slices them at the
+  wrong boundaries. The update path adopted the layout of the content it was replacing
+  instead of the content it was reusing, so `readRange()` on such a record returned short
+  reads until the next rewrite.
 
 ### Changed
 

@@ -18,6 +18,27 @@ async function chunkCountFor(db: FileDB, contentId: string): Promise<number> {
 }
 
 /**
+ * Opens a database at `version`, optionally building its schema, then closes the
+ * connection again so it cannot block the library's own upgrade later.
+ */
+async function openSeed(
+  factory: IDBFactory,
+  name: string,
+  version: number,
+  upgrade?: (db: IDBDatabase) => void,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const request = factory.open(name, version);
+    request.onupgradeneeded = () => upgrade?.(request.result);
+    request.onsuccess = () => {
+      request.result.close();
+      resolve();
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+/**
  * Builds a database the way schema version 1 wrote it: chunks keyed by record id.
  *
  * The library always opens at the current version, so an upgrade can only be exercised
@@ -28,36 +49,26 @@ async function seedVersionOne(
   name: string,
   entries: ReadonlyArray<{ name: string; hash: string | null; bytes: ArrayBuffer }>,
 ): Promise<void> {
-  const open = factory.open(name, 1);
-  await new Promise<void>((resolve, reject) => {
-    open.onupgradeneeded = () => {
-      const db = open.result;
-      const files = db.createObjectStore('files', { keyPath: 'id' });
-      // Every index version 1 created, except the content index that version 2 adds.
-      files.createIndex('by_name', 'nameLower', { unique: false });
-      files.createIndex('by_kind', 'kind', { unique: false });
-      files.createIndex('by_mime', 'mime', { unique: false });
-      files.createIndex('by_extension', 'extension', { unique: false });
-      files.createIndex('by_size', 'size', { unique: false });
-      files.createIndex('by_created', 'createdAt', { unique: false });
-      files.createIndex('by_updated', 'updatedAt', { unique: false });
-      files.createIndex('by_accessed', 'accessedAt', { unique: false });
-      files.createIndex('by_folder', 'folder', { unique: false });
-      files.createIndex('by_tags', 'tags', { unique: false, multiEntry: true });
-      files.createIndex('by_favorite', 'favorite', { unique: false });
-      files.createIndex('by_deleted', 'deletedAt', { unique: false });
-      files.createIndex('by_hash', 'hash', { unique: false });
-      const chunks = db.createObjectStore('chunks', { keyPath: ['fileId', 'index'] });
-      chunks.createIndex('by_file', 'fileId', { unique: false });
-      db.createObjectStore('thumbnails', { keyPath: 'id' });
-      db.createObjectStore('meta', { keyPath: 'key' });
-    };
-    open.onsuccess = () => {
-      // Leaving this connection open would block the library's upgrade to version 2.
-      open.result.close();
-      resolve();
-    };
-    open.onerror = () => reject(open.error);
+  await openSeed(factory, name, 1, (db) => {
+    const files = db.createObjectStore('files', { keyPath: 'id' });
+    // Every index version 1 created, except the content index that version 2 adds.
+    files.createIndex('by_name', 'nameLower', { unique: false });
+    files.createIndex('by_kind', 'kind', { unique: false });
+    files.createIndex('by_mime', 'mime', { unique: false });
+    files.createIndex('by_extension', 'extension', { unique: false });
+    files.createIndex('by_size', 'size', { unique: false });
+    files.createIndex('by_created', 'createdAt', { unique: false });
+    files.createIndex('by_updated', 'updatedAt', { unique: false });
+    files.createIndex('by_accessed', 'accessedAt', { unique: false });
+    files.createIndex('by_folder', 'folder', { unique: false });
+    files.createIndex('by_tags', 'tags', { unique: false, multiEntry: true });
+    files.createIndex('by_favorite', 'favorite', { unique: false });
+    files.createIndex('by_deleted', 'deletedAt', { unique: false });
+    files.createIndex('by_hash', 'hash', { unique: false });
+    const chunks = db.createObjectStore('chunks', { keyPath: ['fileId', 'index'] });
+    chunks.createIndex('by_file', 'fileId', { unique: false });
+    db.createObjectStore('thumbnails', { keyPath: 'id' });
+    db.createObjectStore('meta', { keyPath: 'key' });
   });
 
   const db = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -129,15 +140,8 @@ async function seedStaleVersionTwo(
   entries: ReadonlyArray<{ name: string; hash: string | null; bytes: ArrayBuffer }>,
 ): Promise<void> {
   await seedVersionOne(factory, name, entries);
-  await new Promise<void>((resolve, reject) => {
-    const open = factory.open(name, 2);
-    open.onupgradeneeded = () => undefined;
-    open.onsuccess = () => {
-      open.result.close();
-      resolve();
-    };
-    open.onerror = () => reject(open.error);
-  });
+  // Raising the version without rekeying is what leaves the database half-migrated.
+  await openSeed(factory, name, 2);
 }
 
 describe('FileDB lifecycle', () => {
@@ -469,6 +473,28 @@ describe('update', () => {
     expect(updated.hash).not.toBe(record.hash);
     expect(await db.getText(record.id)).toBe('brand new content');
     expect(await textOf(await db.getBlob(record.id))).toBe('brand new content');
+    db.close();
+  });
+
+  it('adopts the shared layout when new bytes already exist', async () => {
+    const db = await openDb({ chunkSize: 4 });
+    const payload = await makeBlob(16).arrayBuffer();
+    // The record that supplies the content chunks its bytes four at a time.
+    const owner = await db.add(payload, { name: 'owner.bin' });
+    // The record being replaced holds one long chunk of its own.
+    const replaced = await db.add(makeBlob(4, 'application/octet-stream'), {
+      name: 'replaced.bin',
+      chunkSize: 16,
+    });
+    expect(replaced.chunkSize).toBe(16);
+
+    const updated = await db.update(replaced.id, { data: new Blob([payload]) });
+
+    expect(updated.contentId).toBe(owner.contentId);
+    // Reading the range back needs the owner's boundaries, not the replaced record's.
+    expect(updated.chunkSize).toBe(4);
+    expect((await db.readRange(replaced.id, 0, 16)).size).toBe(16);
+    expect((await db.getBlob(replaced.id)).size).toBe(16);
     db.close();
   });
 

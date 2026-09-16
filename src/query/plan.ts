@@ -46,12 +46,12 @@ export function planIndex(where: Where | undefined): IndexPlan {
 function directPlan(filter: Where): IndexPlan | null {
   return (
     idPlan(filter.id) ??
-    namePlan(filter.name) ??
-    stringPlan(filter.mime, INDEX.mime) ??
-    stringPlan(filter.extension, INDEX.extension) ??
-    stringPlan(filter.hash, INDEX.hash) ??
+    stringOperatorPlan(filter.name, INDEX.name, lowerCase) ??
+    stringOperatorPlan(filter.mime, INDEX.mime, lowerCase) ??
+    stringOperatorPlan(filter.extension, INDEX.extension, lowerCase) ??
+    stringOperatorPlan(filter.hash, INDEX.hash, lowerCase) ??
     singleValuePlan(filter.kind, INDEX.kind) ??
-    folderPlan(filter.folder)
+    stringOperatorPlan(filter.folder, INDEX.folder, normalizeFolder)
   );
 }
 
@@ -100,51 +100,34 @@ function ranged(index: string | null, range: IDBKeyRange | null): IndexPlan {
   return { index, range, direction: 'next', empty: false };
 }
 
-function namePlan(filter: Where['name']): IndexPlan | null {
-  if (filter === undefined) return null;
-  if (typeof filter === 'string') return exactPlan(INDEX.name, filter.toLowerCase());
-  if (Array.isArray(filter)) return null;
-  const operators = filter as StringOperators;
-  if (operators.eq !== undefined) return exactPlan(INDEX.name, operators.eq.toLowerCase());
-  if (operators.startsWith !== undefined) {
-    return prefixPlan(INDEX.name, operators.startsWith.toLowerCase());
-  }
-  if (operators.in && operators.in.length === 1) {
-    return exactPlan(INDEX.name, (operators.in[0] as string).toLowerCase());
-  }
-  return null;
-}
+/** How an index's keys are derived from a filter value. */
+type KeyNormalizer = (value: string) => string;
 
-function stringPlan(
-  filter: OneOrMany<string> | StringOperators | undefined,
-  index: string,
-): IndexPlan | null {
-  if (filter === undefined) return null;
-  if (typeof filter === 'string') return exactPlan(index, filter.toLowerCase());
-  if (Array.isArray(filter)) return null;
-  const operators = filter as StringOperators;
-  if (operators.eq !== undefined) return exactPlan(index, operators.eq.toLowerCase());
-  if (operators.startsWith !== undefined) {
-    return prefixPlan(index, operators.startsWith.toLowerCase());
-  }
-  return null;
-}
+const lowerCase = (value: string): string => value.toLowerCase();
 
 /**
- * Plans a subtree scan for `folder: { startsWith }`.
+ * Plans a scan from a string filter: one value scans its own key, `startsWith`
+ * scans the prefix range, and anything else falls through to the predicate pass.
  *
- * Folders are normalised and stored ordered, so a prefix range narrows the scan
- * the same way it does for names. The range can still admit siblings such as
- * `/photos-old`, which is why `matchesFolder` stays the correctness guard.
+ * `normalize` must match the column the index is built on: the lowercased one for
+ * name, MIME type, extension and hash, and the path-normalised one for folders,
+ * whose index preserves case.
  */
-function folderPlan(filter: Where['folder']): IndexPlan | null {
+function stringOperatorPlan(
+  filter: OneOrMany<string> | StringOperators | undefined,
+  index: string,
+  normalize: KeyNormalizer,
+): IndexPlan | null {
   if (filter === undefined) return null;
-  if (typeof filter === 'string') return exactPlan(INDEX.folder, normalizeFolder(filter));
+  if (typeof filter === 'string') return exactPlan(index, normalize(filter));
   if (Array.isArray(filter)) return null;
-  const operators = filter as Exclude<NonNullable<Where['folder']>, string | readonly string[]>;
-  if (operators.eq !== undefined) return exactPlan(INDEX.folder, normalizeFolder(operators.eq));
-  if (operators.startsWith !== undefined) {
-    return prefixPlan(INDEX.folder, normalizeFolder(operators.startsWith));
+
+  const operators = filter as StringOperators;
+  if (operators.eq !== undefined) return exactPlan(index, normalize(operators.eq));
+  if (operators.startsWith !== undefined) return prefixPlan(index, normalize(operators.startsWith));
+  // A one-entry `in` list names exactly one key, which is still a single-value scan.
+  if (operators.in && operators.in.length === 1) {
+    return exactPlan(index, normalize(operators.in[0] as string));
   }
   return null;
 }
@@ -157,7 +140,9 @@ function folderPlan(filter: Where['folder']): IndexPlan | null {
  *
  * Callers pass the prefix already normalised for the index being scanned: an
  * index on a lowercase column needs a lowercased prefix, and the folder index
- * needs a normalised path, because it preserves case.
+ * needs a normalised path, because it preserves case. A prefix range can admit
+ * siblings such as `/photos-old` for `/photos`, so the predicate pass stays the
+ * correctness guard either way.
  */
 function prefixPlan(index: string, prefix: string): IndexPlan {
   return ranged(index, IDBKeyRange.bound(prefix, `${prefix}${HIGH_CHAR}`, false, true));

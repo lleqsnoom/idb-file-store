@@ -140,9 +140,9 @@ export interface StorageStats {
   count: number;
   /** Total bytes of live records, counted per record. Sharing can make this exceed what is stored. */
   size: number;
-  /** Bytes actually held in the chunk store. Never above `size`. */
+  /** Bytes actually held in the chunk store, including content the trash still holds. */
   physicalSize: number;
-  /** `size - physicalSize`: the bytes saved by records sharing identical content. */
+  /** `size - physicalSize`, floored at zero: what sharing saves, less any trashed bytes. */
   sharedBytes: number;
   /** Number of trashed records. */
   trashedCount: number;

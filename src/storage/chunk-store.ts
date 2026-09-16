@@ -53,7 +53,6 @@ export async function hasContent(
   return (await countChunks(transaction, wait, contentId)) > 0;
 }
 
-/** Number of chunks stored for a content id. */
 export function countChunks(
   transaction: IDBTransaction,
   wait: Wait,
@@ -144,7 +143,6 @@ export async function readChunkRange(
   return new Blob(parts, { type: mime });
 }
 
-/** Deletes every chunk belonging to a content id. */
 export async function deleteChunks(
   transaction: IDBTransaction,
   wait: Wait,
